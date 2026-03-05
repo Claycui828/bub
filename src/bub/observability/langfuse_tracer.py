@@ -1,8 +1,8 @@
-"""Langfuse tracing backend."""
+"""Langfuse tracing backend (v3 API)."""
 
 from __future__ import annotations
 
-import time
+from datetime import UTC, datetime
 from typing import Any
 
 from loguru import logger
@@ -13,7 +13,7 @@ from bub.observability.tracer import GenerationSpan, Span, TracerBackend, _gen_i
 class LangfuseBackend(TracerBackend):
     """Langfuse tracing backend for LLM-specific observability.
 
-    Requires: pip install langfuse
+    Requires: pip install langfuse>=3
     Config via env or explicit args:
       LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST
     """
@@ -39,45 +39,31 @@ class LangfuseBackend(TracerBackend):
             kwargs["host"] = host
 
         self._client = Langfuse(**kwargs)
-        # Map span_id -> langfuse object (trace/span/generation).
+        # Map span_id -> langfuse handle (LangfuseSpan / LangfuseGeneration).
         self._handles: dict[str, Any] = {}
-        self._trace_ids: dict[str, str] = {}  # span_id -> langfuse trace_id
-        logger.info("observability.langfuse.init host={}", self._client.base_url)
+        logger.info("observability.langfuse.init host={}", host or "default")
 
     def start_trace(self, name: str, *, input: Any = None, metadata: dict[str, Any] | None = None) -> Span:
-        trace_id = _gen_id()
-        span_id = trace_id  # Root span shares trace_id.
-        trace = self._client.trace(
-            id=trace_id,
-            name=name,
-            input=input,
-            metadata=metadata or {},
-        )
-        self._handles[span_id] = trace
-        self._trace_ids[span_id] = trace_id
-        return Span(trace_id=trace_id, span_id=span_id, name=name, _backend=self, _handle=trace)
+        span_id = _gen_id()
+        # In Langfuse v3, a top-level span implicitly creates a trace.
+        handle = self._client.start_span(name=name, input=input, metadata=metadata or {})
+        trace_id = handle.trace_id
+        self._handles[span_id] = handle
+        return Span(trace_id=trace_id, span_id=span_id, name=name, _backend=self, _handle=handle)
 
     def start_span(
         self, name: str, *, parent: Span | None = None, input: Any = None, metadata: dict[str, Any] | None = None
     ) -> Span:
         span_id = _gen_id()
         parent_handle = self._handles.get(parent.span_id) if parent else None
-        trace_id = (parent.trace_id if parent else None) or _gen_id()
 
         if parent_handle is not None:
-            handle = parent_handle.span(
-                id=span_id,
-                name=name,
-                input=input,
-                metadata=metadata or {},
-            )
+            handle = parent_handle.start_span(name=name, input=input, metadata=metadata or {})
         else:
-            handle = self._client.trace(id=trace_id, name="orphan").span(
-                id=span_id, name=name, input=input, metadata=metadata or {}
-            )
+            handle = self._client.start_span(name=name, input=input, metadata=metadata or {})
 
+        trace_id = handle.trace_id
         self._handles[span_id] = handle
-        self._trace_ids[span_id] = trace_id
         return Span(trace_id=trace_id, span_id=span_id, name=name, _backend=self, _handle=handle)
 
     def start_generation(
@@ -91,24 +77,23 @@ class LangfuseBackend(TracerBackend):
     ) -> GenerationSpan:
         span_id = _gen_id()
         parent_handle = self._handles.get(parent.span_id) if parent else None
-        trace_id = (parent.trace_id if parent else None) or _gen_id()
 
         gen_kwargs: dict[str, Any] = {
-            "id": span_id,
             "name": name,
-            "model": model,
             "metadata": metadata or {},
         }
+        if model:
+            gen_kwargs["model"] = model
         if input_messages:
             gen_kwargs["input"] = input_messages
 
         if parent_handle is not None:
-            handle = parent_handle.generation(**gen_kwargs)
+            handle = parent_handle.start_generation(**gen_kwargs)
         else:
-            handle = self._client.trace(id=trace_id, name="orphan").generation(**gen_kwargs)
+            handle = self._client.start_generation(**gen_kwargs)
 
+        trace_id = handle.trace_id
         self._handles[span_id] = handle
-        self._trace_ids[span_id] = trace_id
         return GenerationSpan(
             trace_id=trace_id,
             span_id=span_id,
@@ -125,14 +110,17 @@ class LangfuseBackend(TracerBackend):
         handle = self._handles.pop(span.span_id, None)
         if handle is None:
             return
-        update_kwargs: dict[str, Any] = {"end_time": _now()}
+        # Langfuse v3: update() sets fields, end() just marks completion.
+        update_kwargs: dict[str, Any] = {}
         if output is not None:
             update_kwargs["output"] = output
         if metadata:
             update_kwargs["metadata"] = metadata
         if level != "DEFAULT":
             update_kwargs["level"] = level
-        handle.end(**update_kwargs) if hasattr(handle, "end") else handle.update(**update_kwargs)
+        if update_kwargs:
+            handle.update(**update_kwargs)
+        handle.end()
 
     def end_generation(
         self,
@@ -146,7 +134,7 @@ class LangfuseBackend(TracerBackend):
         handle = self._handles.pop(span.span_id, None)
         if handle is None:
             return
-        update_kwargs: dict[str, Any] = {"end_time": _now()}
+        update_kwargs: dict[str, Any] = {}
         if output is not None:
             update_kwargs["output"] = output
         if metadata:
@@ -154,8 +142,10 @@ class LangfuseBackend(TracerBackend):
         if level != "DEFAULT":
             update_kwargs["level"] = level
         if usage:
-            update_kwargs["usage"] = usage
-        handle.end(**update_kwargs) if hasattr(handle, "end") else handle.update(**update_kwargs)
+            update_kwargs["usage_details"] = usage
+        if update_kwargs:
+            handle.update(**update_kwargs)
+        handle.end()
 
     def update_span(self, span: Span, *, metadata: dict[str, Any] | None = None, output: Any = None) -> None:
         handle = self._handles.get(span.span_id)
@@ -175,9 +165,3 @@ class LangfuseBackend(TracerBackend):
     def shutdown(self) -> None:
         self._client.flush()
         self._client.shutdown()
-
-
-def _now() -> Any:
-    from datetime import UTC, datetime
-
-    return datetime.now(UTC)
