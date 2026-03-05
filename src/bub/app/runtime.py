@@ -23,6 +23,9 @@ from bub.app.jobstore import JSONJobStore
 from bub.config.settings import Settings
 from bub.core import AgentLoop, InputRouter, LoopResult, ModelRunner
 from bub.integrations.republic_client import build_llm, build_tape_store, read_workspace_agents_prompt
+from bub.observability import current_tracer
+from bub.observability.factory import build_tracer
+from bub.observability.tracer import set_tracer
 from bub.skills.loader import SkillMetadata, discover_skills
 from bub.tape import TapeService, default_tape_context
 from bub.tools import ProgressiveToolView, ToolRegistry
@@ -81,6 +84,10 @@ class AppRuntime:
         self._active_inputs: set[asyncio.Task[LoopResult]] = set()
         self._enable_scheduler = enable_scheduler
 
+        # Observability.
+        self._tracer = build_tracer(settings)
+        set_tracer(self._tracer)
+
     def _default_scheduler(self) -> BaseScheduler:
         job_store = JSONJobStore(self.settings.resolve_home() / "jobs.json")
         return BackgroundScheduler(daemon=True, jobstores={"default": job_store})
@@ -94,6 +101,8 @@ class AppRuntime:
         if self.scheduler.running and self._enable_scheduler:
             with suppress(Exception):
                 self.scheduler.shutdown()
+        with suppress(Exception):
+            self._tracer.shutdown()
 
     def discover_skills(self) -> list[SkillMetadata]:
         discovered = discover_skills(self.workspace)
@@ -101,15 +110,41 @@ class AppRuntime:
             return discovered
         return [skill for skill in discovered if skill.name.casefold() in self._allowed_skills]
 
-    def get_session(self, session_id: str) -> SessionRuntime:
+    def get_session(
+        self,
+        session_id: str,
+        *,
+        model: str | None = None,
+        system_prompt: str | None = None,
+        allowed_tools: set[str] | None = None,
+    ) -> SessionRuntime:
         existing = self._sessions.get(session_id)
         if existing is not None:
             return existing
 
-        tape_name = f"{self.settings.tape_name}:{_session_slug(session_id)}"
-        tape = TapeService(self._llm, tape_name, store=self._store)
+        effective_model = model or self.settings.model
+        effective_system_prompt = system_prompt if system_prompt is not None else self.settings.system_prompt
 
-        registry = ToolRegistry(self._allowed_tools)
+        # For sub-agent sessions with a different model, build a dedicated LLM.
+        if model and model != self.settings.model:
+            from bub.config.settings import Settings
+
+            sub_settings = Settings(
+                model=model,
+                api_key=self.settings.api_key,
+                api_base=self.settings.api_base,
+                llm_api_key=self.settings.llm_api_key,
+                openrouter_api_key=self.settings.openrouter_api_key,
+            )
+            llm = build_llm(sub_settings, self._store)
+        else:
+            llm = self._llm
+
+        tape_name = f"{self.settings.tape_name}:{_session_slug(session_id)}"
+        tape = TapeService(llm, tape_name, store=self._store)
+
+        effective_allowed_tools = _normalize_name_set(allowed_tools) if allowed_tools is not None else self._allowed_tools
+        registry = ToolRegistry(effective_allowed_tools)
         register_builtin_tools(registry, workspace=self.workspace, tape=tape, runtime=self)
         tool_view = ProgressiveToolView(registry)
         router = InputRouter(registry, tool_view, tape, self.workspace)
@@ -119,11 +154,11 @@ class AppRuntime:
             tool_view=tool_view,
             tools=registry.model_tools(),
             list_skills=self.discover_skills,
-            model=self.settings.model,
+            model=effective_model,
             max_steps=self.settings.max_steps,
             max_tokens=self.settings.max_tokens,
             model_timeout_seconds=self.settings.model_timeout_seconds,
-            base_system_prompt=self.settings.system_prompt,
+            base_system_prompt=effective_system_prompt,
             get_workspace_system_prompt=lambda: read_workspace_agents_prompt(self.workspace),
         )
         loop = AgentLoop(router=router, model_runner=runner, tape=tape)
@@ -131,14 +166,37 @@ class AppRuntime:
         self._sessions[session_id] = runtime
         return runtime
 
-    async def handle_input(self, session_id: str, text: str) -> LoopResult:
-        session = self.get_session(session_id)
-        task = asyncio.create_task(session.handle_input(text))
-        self._active_inputs.add(task)
-        try:
-            return await task
-        finally:
-            self._active_inputs.discard(task)
+    async def handle_input(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        model: str | None = None,
+        system_prompt: str | None = None,
+        allowed_tools: set[str] | None = None,
+    ) -> LoopResult:
+        session = self.get_session(
+            session_id, model=model, system_prompt=system_prompt, allowed_tools=allowed_tools
+        )
+        tracer = current_tracer()
+        with tracer.trace(
+            "session.handle_input",
+            input=text,
+            metadata={"session_id": session_id, "model": model or self.settings.model},
+        ) as trace_span:
+            task = asyncio.create_task(session.handle_input(text))
+            self._active_inputs.add(task)
+            try:
+                result = await task
+                trace_span.end(
+                    output=result.assistant_output[:2048] if result.assistant_output else None,
+                    metadata={"steps": result.steps, "error": result.error},
+                    level="ERROR" if result.error else "DEFAULT",
+                )
+                return result
+            finally:
+                self._active_inputs.discard(task)
+                tracer.flush()
 
     async def _cancel_active_inputs(self) -> int:
         """Cancel all in-flight input tasks and return canceled count."""

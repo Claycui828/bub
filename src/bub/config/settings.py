@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     discord_command_prefix: str = "!"
     discord_proxy: str | None = None
 
+    trace_enabled: bool = False
+    trace_backend: str = "langfuse"  # langfuse | otel
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: str | None = None
+    langfuse_host: str | None = None
+    otel_service_name: str = "bub"
+    otel_endpoint: str | None = None
+
     @property
     def resolved_api_key(self) -> str | None:
         if self.api_key:

@@ -200,13 +200,23 @@ class ToolRegistry:
         kwargs: dict[str, Any],
         context: ToolContext | None = None,
     ) -> Any:
+        from bub.observability import current_tracer
+
         descriptor = self.get(name)
         if descriptor is None:
             raise KeyError(name)
 
-        if descriptor.tool.context:
-            kwargs["context"] = context
-        result = descriptor.tool.run(**kwargs)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
+        tracer = current_tracer()
+        call_kwargs = {key: value for key, value in kwargs.items() if key != "context"}
+        with tracer.span(f"tool.{name}", input=call_kwargs, metadata={"source": descriptor.source}) as span:
+            if descriptor.tool.context:
+                kwargs["context"] = context
+            try:
+                result = descriptor.tool.run(**kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+                span.end(output=str(result)[:2048] if result else None)
+                return result
+            except Exception as exc:
+                span.end(output=str(exc), level="ERROR")
+                raise

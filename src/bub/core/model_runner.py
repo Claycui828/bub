@@ -13,6 +13,7 @@ from loguru import logger
 from republic import Tool, ToolAutoResult
 
 from bub.core.router import AssistantRouteResult, InputRouter
+from bub.observability import current_tracer
 from bub.skills.loader import SkillMetadata
 from bub.skills.view import render_compact_skills
 from bub.tape.service import TapeService
@@ -82,6 +83,7 @@ class ModelRunner:
         self._expanded_skills.clear()
 
     async def run(self, prompt: str) -> ModelTurnResult:
+        tracer = current_tracer()
         state = _PromptState(prompt=prompt)
         self._activate_hints(prompt)
 
@@ -95,7 +97,8 @@ class ModelRunner:
                     "model": self._model,
                 },
             )
-            response = await self._chat(state.prompt)
+            with tracer.span(f"loop.step.{state.step}", metadata={"model": self._model, "step": state.step}):
+                response = await self._chat(state.prompt)
             if response.error is not None:
                 state.error = response.error
                 await self._tape.append_event(
@@ -162,7 +165,17 @@ class ModelRunner:
         )
 
     async def _chat(self, prompt: str) -> _ChatResult:
+        tracer = current_tracer()
         system_prompt = self._render_system_prompt()
+        gen_span = tracer.generation(
+            "llm.chat",
+            model=self._model,
+            input_messages=[
+                {"role": "system", "content": system_prompt[:1024]},
+                {"role": "user", "content": prompt[:1024]},
+            ],
+            metadata={"max_tokens": self._max_tokens},
+        )
         try:
             async with asyncio.timeout(self._model_timeout_seconds):
                 provider, _, _ = self._model.partition(":")
@@ -182,14 +195,26 @@ class ModelRunner:
                         tools=self._tools,
                         extra_headers=self.DEFAULT_HEADERS,
                     )
-                return _ChatResult.from_tool_auto(output)
+                result = _ChatResult.from_tool_auto(output)
+                usage = getattr(output, "usage", None)
+                usage_dict = None
+                if usage and isinstance(usage, dict):
+                    usage_dict = usage
+                gen_span.end(
+                    output=result.text[:1024] if result.text else result.error,
+                    usage=usage_dict,
+                    level="ERROR" if result.error else "DEFAULT",
+                )
+                return result
         except TimeoutError:
+            gen_span.end(output="model_timeout", level="ERROR")
             return _ChatResult(
                 text="",
                 error=f"model_timeout: no response within {self._model_timeout_seconds}s",
             )
         except Exception as exc:
             logger.exception("model.call.error")
+            gen_span.end(output=str(exc), level="ERROR")
             return _ChatResult(text="", error=f"model_call_error: {exc!s}")
 
     def _render_system_prompt(self) -> str:
