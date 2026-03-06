@@ -40,6 +40,7 @@ dependencies = [
     "any-llm-sdk[anthropic,vertexai]>=1.8.0",
     "httpx[socks]>=0.28.1",
     "langfuse>=3.14.5",
+    "mcp>=1.0.0",
 ]
 
 [project.optional-dependencies]

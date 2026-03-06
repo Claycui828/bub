@@ -144,6 +144,7 @@ def run(
 async def _run_once(runtime: AppRuntime, session_id: str, message: str) -> None:
     import rich
 
+    await runtime.connect_mcp()
     async with runtime.graceful_shutdown():
         try:
             result = await runtime.handle_input(session_id, message)
@@ -181,6 +182,7 @@ def message(
 
 
 async def _serve_channels(manager: ChannelManager) -> None:
+    await manager.runtime.connect_mcp()
     task = asyncio.create_task(manager.run())
     try:
         async with manager.runtime.graceful_shutdown() as stop_event:

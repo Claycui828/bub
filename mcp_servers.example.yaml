@@ -1,0 +1,30 @@
+# MCP Servers Configuration
+#
+# Place this file at:
+#   ~/.bub/mcp_servers.yaml        (global, all projects)
+#   <project>/.bub/mcp_servers.yaml (project-specific, overrides global)
+#
+# Project-level configs merge into global configs (last wins for same server name).
+#
+# Each top-level key is a server name. Tools are registered as mcp__{server}__{tool}.
+
+# --- Stdio transport (spawns a subprocess) ---
+
+# filesystem:
+#   command: npx
+#   args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+# github:
+#   command: uvx
+#   args: ["mcp-server-github"]
+#   env:
+#     GITHUB_TOKEN: "ghp_..."
+
+# sqlite:
+#   command: uvx
+#   args: ["mcp-server-sqlite", "--db-path", "./data.db"]
+
+# --- Streamable HTTP transport (connects to a remote server) ---
+
+# remote:
+#   url: "http://localhost:8000/mcp"

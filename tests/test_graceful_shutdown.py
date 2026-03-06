@@ -57,6 +57,9 @@ async def test_channel_manager_shutdown_propagates_channel_stop_error() -> None:
 @pytest.mark.asyncio
 async def test_serve_channels_handles_cancelled_error_from_graceful_shutdown() -> None:
     class _DummyRuntime:
+        async def connect_mcp(self) -> int:
+            return 0
+
         @contextlib.asynccontextmanager
         async def graceful_shutdown(self):
             stop_event = asyncio.Event()

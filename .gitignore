@@ -96,6 +96,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Bub local config (may contain API keys)
+.bub/
+
 # Environments
 .env
 .venv

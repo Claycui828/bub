@@ -40,6 +40,9 @@ class DummyRuntime:
     def set_bus(self, _bus) -> None:
         return None
 
+    async def connect_mcp(self) -> int:
+        return 0
+
     def get_session(self, _session_id: str):
         class _Tape:
             @staticmethod
@@ -252,6 +255,9 @@ async def test_serve_channels_stops_manager_on_sigterm(monkeypatch) -> None:
     class _DummyRuntime:
         def __init__(self) -> None:
             self.stop_event: asyncio.Event | None = None
+
+        async def connect_mcp(self) -> int:
+            return 0
 
         @contextlib.asynccontextmanager
         async def graceful_shutdown(self):

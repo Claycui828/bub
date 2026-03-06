@@ -23,6 +23,7 @@ from bub.app.jobstore import JSONJobStore
 from bub.config.settings import Settings
 from bub.core import AgentLoop, InputRouter, LoopResult, ModelRunner
 from bub.integrations.republic_client import build_llm, build_tape_store, read_workspace_agents_prompt
+from bub.mcp.client import McpClientManager, load_mcp_configs
 from bub.observability import current_tracer
 from bub.observability.factory import build_tracer
 from bub.observability.tracer import set_tracer
@@ -98,6 +99,11 @@ class AppRuntime:
         self._tracer = build_tracer(settings)
         set_tracer(self._tracer)
 
+        # MCP client manager.
+        mcp_configs = load_mcp_configs(self.workspace, settings.resolve_home())
+        self._mcp = McpClientManager(mcp_configs)
+        self._mcp_connected = False
+
     def _default_scheduler(self) -> BaseScheduler:
         job_store = JSONJobStore(self.settings.resolve_home() / "jobs.json")
         return BackgroundScheduler(daemon=True, jobstores={"default": job_store})
@@ -130,11 +136,33 @@ class AppRuntime:
         )
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._mcp_connected:
+            with suppress(Exception):
+                asyncio.get_event_loop().run_until_complete(self._mcp.close())
         if self.scheduler.running and self._enable_scheduler:
             with suppress(Exception):
                 self.scheduler.shutdown()
         with suppress(Exception):
             self._tracer.shutdown()
+
+    async def connect_mcp(self) -> int:
+        """Connect to configured MCP servers. Returns number of tools discovered."""
+        if self._mcp_connected or not self._mcp._configs:
+            return 0
+        tools = await self._mcp.connect_all()
+        self._mcp_connected = True
+        logger.info("mcp.client.ready tools={}", len(tools))
+        return len(tools)
+
+    def _register_mcp_tools(self, registry: ToolRegistry) -> None:
+        """Register discovered MCP tools into a session's registry."""
+        if not self._mcp_connected:
+            return
+        from bub.mcp.bridge import register_mcp_tools
+
+        count = register_mcp_tools(registry, self._mcp)
+        if count:
+            logger.info("mcp.tools.registered count={}", count)
 
     def discover_skills(self) -> list[SkillMetadata]:
         discovered = discover_skills(self.workspace)
@@ -178,6 +206,7 @@ class AppRuntime:
         effective_allowed_tools = _normalize_name_set(allowed_tools) if allowed_tools is not None else self._allowed_tools
         registry = ToolRegistry(effective_allowed_tools)
         register_builtin_tools(registry, workspace=self.workspace, tape=tape, runtime=self)
+        self._register_mcp_tools(registry)
         tool_view = ProgressiveToolView(registry)
         router = InputRouter(registry, tool_view, tape, self.workspace)
         runner = ModelRunner(
