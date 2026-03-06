@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import os
+import re as re_module
 import shutil
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -21,7 +23,7 @@ from republic import ToolContext
 
 from bub.tape.service import TapeService
 from bub.tools.agent import register_agent_tools
-from bub.tools.registry import ToolRegistry
+from bub.tools.registry import ToolGuidance, ToolRegistry
 from bub.tools.task import register_task_tools
 
 if TYPE_CHECKING:
@@ -36,44 +38,66 @@ SESSION_ID_ENV_VAR = "BUB_SESSION_ID"
 
 
 class BashInput(BaseModel):
-    cmd: str = Field(..., description="Shell command")
-    cwd: str | None = Field(default=None, description="Working directory")
+    cmd: str = Field(..., description="The bash command to execute. Use && to chain dependent commands. Quote paths with spaces.")
+    cwd: str | None = Field(default=None, description="Working directory override. Defaults to workspace root if not specified.")
     timeout_seconds: int = Field(
-        default=SUBPROCESS_TIMEOUT_SECONDS, ge=1, description="Maximum seconds to allow command to run"
+        default=SUBPROCESS_TIMEOUT_SECONDS,
+        ge=1,
+        description="Maximum seconds before the command is killed. Default 30s. Increase for long builds or downloads.",
     )
 
 
 class ReadInput(BaseModel):
-    path: str = Field(..., description="File path")
-    offset: int = Field(default=0, ge=0)
-    limit: int | None = Field(default=None, ge=1)
+    path: str = Field(..., description="Absolute or workspace-relative file path to read")
+    offset: int = Field(default=0, ge=0, description="Line number to start reading from (0-based). Use with limit for large files.")
+    limit: int | None = Field(default=None, ge=1, description="Maximum number of lines to return. Omit to read entire file.")
 
 
 class WriteInput(BaseModel):
-    path: str = Field(..., description="File path")
-    content: str = Field(..., description="File content")
+    path: str = Field(..., description="Absolute or workspace-relative file path. Parent directories are created automatically.")
+    content: str = Field(..., description="Complete file content to write as UTF-8 text. This replaces the entire file.")
 
 
 class EditInput(BaseModel):
-    path: str = Field(..., description="File path")
-    old: str = Field(..., description="Search text")
-    new: str = Field(..., description="Replacement text")
-    start_line: int = Field(default=0, ge=0, description="Start line number to search from")
+    path: str = Field(..., description="Absolute or workspace-relative path to the file to edit. File must exist.")
+    old: str = Field(..., description="Exact text to find in the file. Must match verbatim including whitespace and indentation.")
+    new: str = Field(..., description="Replacement text. All occurrences of old text (from start_line onward) are replaced.")
+    start_line: int = Field(
+        default=0,
+        ge=0,
+        description="Line number to start searching from (0-based). Use when old text appears multiple times to narrow scope.",
+    )
+
+
+class GrepInput(BaseModel):
+    pattern: str = Field(..., description="Regular expression pattern (Python re / ripgrep syntax). E.g. 'def\\s+\\w+', 'TODO|FIXME'.")
+    path: str = Field(default=".", description="File or directory to search in. Relative to workspace root.")
+    include: str | None = Field(default=None, description="Glob pattern to filter files. E.g. '*.py', '*.{ts,tsx}', 'src/**/*.js'.")
+    max_results: int = Field(default=50, ge=1, le=200, description="Maximum matching lines to return. Increase for broad searches.")
+    context_lines: int = Field(default=0, ge=0, le=5, description="Lines of context to show before and after each match (like grep -C).")
+
+
+class GlobInput(BaseModel):
+    pattern: str = Field(..., description="Glob pattern to match files. E.g. '**/*.py', 'src/**/*.ts', '**/test_*.py', '*.md'.")
+    path: str = Field(default=".", description="Root directory to search from. Relative to workspace root.")
+    max_results: int = Field(default=100, ge=1, le=500, description="Maximum number of file paths to return.")
 
 
 class FetchInput(BaseModel):
-    url: str = Field(..., description="URL")
+    url: str = Field(..., description="Full URL to fetch (http/https). URLs without scheme default to https.")
 
 
 class SearchInput(BaseModel):
-    query: str = Field(..., description="Search query")
-    max_results: int = Field(default=5, ge=1, le=10)
+    query: str = Field(..., description="Search query string. Be specific for better results.")
+    max_results: int = Field(default=5, ge=1, le=10, description="Number of search results to return.")
 
 
 class HandoffInput(BaseModel):
-    name: str | None = Field(default=None, description="Anchor name")
-    summary: str | None = Field(default=None, description="Summary")
-    next_steps: str | None = Field(default=None, description="Next steps")
+    name: str | None = Field(default=None, description="Anchor name for this checkpoint. Defaults to 'handoff'. Use descriptive names like 'phase-1-bootstrap'.")
+    summary: str | None = Field(default=None, description="Self-contained summary of what was accomplished. A reader with no prior context must understand this.")
+    next_steps: str | None = Field(default=None, description="Clear, actionable next steps for the continued work after this checkpoint.")
+    files_modified: list[str] | None = Field(default=None, description="List of file paths that were created or modified in this phase.")
+    decisions: list[str] | None = Field(default=None, description="Key architectural or design decisions made, with brief rationale.")
 
 
 class ToolNameInput(BaseModel):
@@ -160,6 +184,77 @@ def _format_search_results(results: list[object]) -> str:
     return "\n".join(lines) if lines else "none"
 
 
+def _grep_ripgrep(rg: str, params: GrepInput, search_path: Path) -> str:
+    """Run ripgrep for fs.grep."""
+    import subprocess
+
+    cmd = [rg, "--no-heading", "--line-number", "--color=never", f"--max-count={params.max_results}"]
+    if params.context_lines > 0:
+        cmd.append(f"-C{params.context_lines}")
+    if params.include:
+        cmd.extend(["--glob", params.include])
+    cmd.extend([params.pattern, str(search_path)])
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "(search timed out)"
+    if result.returncode == 1:
+        return "(no matches)"
+    if result.returncode > 1:
+        return f"error: {result.stderr.strip()}"
+    lines = result.stdout.strip().splitlines()
+    if len(lines) > params.max_results:
+        lines = lines[: params.max_results]
+        lines.append(f"... (truncated at {params.max_results} results)")
+    return "\n".join(lines) if lines else "(no matches)"
+
+
+def _grep_python(params: GrepInput, search_path: Path) -> str:
+    """Pure-Python fallback for fs.grep."""
+    try:
+        pattern = re_module.compile(params.pattern)
+    except re_module.error as exc:
+        raise RuntimeError(f"invalid regex: {exc}") from exc
+
+    results: list[str] = []
+
+    def _search_file(fpath: Path) -> None:
+        try:
+            text = fpath.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        for line_no, line in enumerate(text.splitlines(), 1):
+            if len(results) >= params.max_results:
+                return
+            if pattern.search(line):
+                rel = str(fpath.relative_to(search_path)) if fpath.is_relative_to(search_path) else str(fpath)
+                results.append(f"{rel}:{line_no}:{line}")
+
+    if search_path.is_file():
+        if params.include is None or fnmatch.fnmatch(search_path.name, params.include):
+            _search_file(search_path)
+    elif search_path.is_dir():
+        for root, _dirs, files in os.walk(search_path):
+            root_path = Path(root)
+            # Skip hidden dirs and common noise
+            if any(part.startswith(".") for part in root_path.relative_to(search_path).parts):
+                continue
+            for fname in sorted(files):
+                if params.include and not fnmatch.fnmatch(fname, params.include):
+                    continue
+                _search_file(root_path / fname)
+                if len(results) >= params.max_results:
+                    break
+            if len(results) >= params.max_results:
+                break
+    else:
+        raise RuntimeError(f"path not found: {search_path}")
+
+    if not results:
+        return "(no matches)"
+    return "\n".join(results)
+
+
 def register_builtin_tools(
     registry: ToolRegistry,
     *,
@@ -172,10 +267,31 @@ def register_builtin_tools(
 
     register = registry.register
 
-    @register(name="bash", short_description="Run shell command", model=BashInput, context=True)
+    @register(
+        name="bash",
+        short_description="Execute a shell command in the workspace directory",
+        model=BashInput,
+        context=True,
+        always_expand=True,
+        guidance=ToolGuidance(
+            when_to_use="Git operations, running tests (pytest/jest/make test), package management (uv/pip/npm), docker, make, and multi-step shell pipelines.",
+            when_not_to="File reads (use fs.read), content search (use fs.grep), file pattern matching (use fs.glob), file writes (use fs.write/fs.edit). Never use bash grep/cat/find/sed when a dedicated tool exists.",
+            examples="bash cmd='git status' | bash cmd='uv run pytest tests/' | bash cmd='docker build -t app .' | bash cmd='git diff HEAD~1'",
+            constraints="Non-zero exit code raises RuntimeError. Default timeout 30s — increase for builds. The workspace .env file is auto-loaded. Do NOT use sleep for delays — use schedule.add instead.",
+        ),
+    )
     async def run_bash(params: BashInput, context: ToolContext) -> str:
-        """Execute bash in workspace. Non-zero exit raises an error.
-        IMPORTANT: please DO NOT use sleep to delay execution, use schedule.add tool instead.
+        """Execute a bash command in the workspace directory.
+
+        Usage:
+        - Prefer dedicated tools over bash: fs.read over cat, fs.write over echo/cat heredoc,
+          fs.edit over sed/awk, fs.grep over grep/rg, fs.glob over find/ls.
+        - Use bash for: git, make, docker, npm/pip/uv, running tests, and any command not covered by dedicated tools.
+        - Always quote file paths containing spaces with double quotes.
+        - Use && to chain dependent commands; use ; when order matters but failure is OK.
+        - The workspace .env file is automatically loaded into the environment.
+        - Non-zero exit code raises RuntimeError with stderr/stdout as the message.
+        - Default timeout is 30s. Increase timeout_seconds for long builds or downloads.
         """
         import dotenv
 
@@ -204,9 +320,26 @@ def register_builtin_tools(
             raise RuntimeError(f"exit={completed.returncode}: {message}")
         return stdout_text or "(no output)"
 
-    @register(name="fs.read", short_description="Read file content", model=ReadInput)
+    @register(
+        name="fs.read",
+        short_description="Read a file's text content with optional line range",
+        model=ReadInput,
+        guidance=ToolGuidance(
+            when_to_use="Inspecting source code, config files, logs. Use offset/limit for large files.",
+            when_not_to="Searching across many files (use fs.grep). Finding files by name (use fs.glob).",
+        ),
+    )
     def fs_read(params: ReadInput) -> str:
-        """Read UTF-8 text with optional offset and limit."""
+        """Read UTF-8 text content from a file.
+
+        Usage:
+        - Returns file content as plain text lines.
+        - Use offset and limit for large files (e.g. offset=100, limit=50 to read lines 100-149).
+        - Omit offset/limit to read the entire file — recommended for most source files.
+        - Read files before editing them to understand the current state.
+        - You can read multiple files in parallel by issuing multiple tool calls.
+        - For searching across many files, use fs.grep instead.
+        """
         file_path = _resolve_path(workspace, params.path)
         text = file_path.read_text(encoding="utf-8")
         lines = text.splitlines()
@@ -214,17 +347,52 @@ def register_builtin_tools(
         end = len(lines) if params.limit is None else min(len(lines), start + params.limit)
         return "\n".join(lines[start:end])
 
-    @register(name="fs.write", short_description="Write file content", model=WriteInput)
+    @register(
+        name="fs.write",
+        short_description="Create or overwrite a file with UTF-8 text",
+        model=WriteInput,
+        guidance=ToolGuidance(
+            when_to_use="Creating new files or completely rewriting existing files.",
+            when_not_to="Making targeted edits to existing files (use fs.edit instead).",
+            constraints="Overwrites existing content completely. Creates parent directories automatically.",
+        ),
+    )
     def fs_write(params: WriteInput) -> str:
-        """Write UTF-8 text to path, creating parent directory if needed."""
+        """Create a new file or completely overwrite an existing file with UTF-8 text.
+
+        Usage:
+        - Creates parent directories automatically if they don't exist.
+        - OVERWRITES the entire file — all previous content is lost.
+        - For targeted edits to existing files, use fs.edit instead.
+        - Prefer fs.edit when only changing a few lines in a large file.
+        - Use this tool for: creating new files, or complete rewrites where most content changes.
+        """
         file_path = _resolve_path(workspace, params.path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(params.content, encoding="utf-8")
         return f"wrote: {file_path}"
 
-    @register(name="fs.edit", short_description="Edit file content", model=EditInput)
+    @register(
+        name="fs.edit",
+        short_description="Find and replace text in an existing file",
+        model=EditInput,
+        guidance=ToolGuidance(
+            when_to_use="Targeted modifications to existing files — changing function signatures, fixing bugs, updating config values.",
+            when_not_to="Creating new files (use fs.write). The old text must exist exactly as specified.",
+            constraints="Replaces ALL occurrences of old text from start_line onward. Use start_line to narrow the search scope when old text appears multiple times.",
+        ),
+    )
     def fs_edit(params: EditInput) -> str:
-        """Replace all occurrences of old text in file."""
+        """Find and replace text in an existing file.
+
+        Usage:
+        - The old text must match EXACTLY — including whitespace, indentation, and line breaks.
+        - Replaces ALL occurrences of old text from start_line onward.
+        - Use start_line to narrow the search when old text appears multiple times in the file.
+        - Always read the file first (fs.read) to get the exact text to match.
+        - For creating new files or complete rewrites, use fs.write instead.
+        - The file must already exist; raises RuntimeError if not found.
+        """
         file_path = _resolve_path(workspace, params.path)
         if not file_path.is_file():
             raise RuntimeError(f"file not found: {file_path}")
@@ -238,9 +406,96 @@ def register_builtin_tools(
         file_path.write_text(f"{prev}\n{new_text}", encoding="utf-8")
         return f"edited: {file_path}"
 
-    @register(name="web.fetch", short_description="Fetch URL as markdown", model=FetchInput)
+    @register(
+        name="fs.grep",
+        short_description="Search file contents by regex pattern",
+        model=GrepInput,
+        guidance=ToolGuidance(
+            when_to_use="Searching for patterns across files: function definitions, imports, string literals, error messages, TODOs.",
+            when_not_to="Finding files by name (use fs.glob). Reading a known file (use fs.read). Running shell commands (use bash).",
+            examples="fs.grep pattern='def\\s+handle_' include='*.py' | fs.grep pattern='TODO|FIXME' | fs.grep pattern='import.*json' path='src/'",
+            constraints="Returns up to max_results matching lines. Binary files are skipped. Uses ripgrep if available, otherwise Python re. Hidden directories (.*) are skipped.",
+        ),
+    )
+    def fs_grep(params: GrepInput) -> str:
+        """Search file contents for lines matching a regex pattern.
+
+        Usage:
+        - Supports full regex syntax: 'def\\s+\\w+', 'TODO|FIXME', 'import.*json'.
+        - Uses ripgrep (rg) when available for speed; falls back to Python re module.
+        - Filter files with include glob: '*.py', '*.{ts,tsx}'.
+        - Binary files and hidden directories (.*) are automatically skipped.
+        - Use context_lines to see surrounding code for each match.
+        - For finding files by name pattern, use fs.glob instead.
+        - For reading a specific known file, use fs.read instead.
+        """
+        search_path = _resolve_path(workspace, params.path)
+        rg = shutil.which("rg")
+        if rg:
+            return _grep_ripgrep(rg, params, search_path)
+        return _grep_python(params, search_path)
+
+    @register(
+        name="fs.glob",
+        short_description="Find files matching a glob pattern",
+        model=GlobInput,
+        guidance=ToolGuidance(
+            when_to_use="Finding files by name pattern: discovering project structure, locating config files, finding test files.",
+            when_not_to="Searching file contents (use fs.grep). Reading a known file (use fs.read). Listing directory contents (use bash ls).",
+            examples="fs.glob pattern='**/*.py' | fs.glob pattern='src/**/*.ts' | fs.glob pattern='**/test_*.py' | fs.glob pattern='*.yaml'",
+            constraints="Returns sorted file paths relative to the search root. Uses pathlib.Path.glob(). Max 500 results.",
+        ),
+    )
+    def fs_glob(params: GlobInput) -> str:
+        """Find files matching a glob pattern, sorted by path.
+
+        Usage:
+        - Common patterns: '**/*.py' (all Python files), 'src/**/*.ts' (TypeScript in src),
+          '**/test_*.py' (test files), '*.md' (markdown in root).
+        - Returns file paths relative to the search root directory.
+        - Results are sorted alphabetically by path.
+        - For searching file CONTENTS, use fs.grep instead.
+        - For reading a specific file, use fs.read instead.
+        """
+        root = _resolve_path(workspace, params.path)
+        if not root.is_dir():
+            raise RuntimeError(f"not a directory: {root}")
+        matches = sorted(root.glob(params.pattern))
+        files = [p for p in matches if p.is_file()]
+        if not files:
+            return "(no matches)"
+        truncated = len(files) > params.max_results
+        files = files[: params.max_results]
+        lines = []
+        for p in files:
+            try:
+                lines.append(str(p.relative_to(root)))
+            except ValueError:
+                lines.append(str(p))
+        if truncated:
+            lines.append(f"... (truncated, showing {params.max_results} of {len(matches)} matches)")
+        return "\n".join(lines)
+
+    @register(
+        name="web.fetch",
+        short_description="Fetch a URL and return content as text",
+        model=FetchInput,
+        guidance=ToolGuidance(
+            when_to_use="Reading web pages, API documentation, or fetching remote resources.",
+            when_not_to="Searching the web for information (use web.search first to find URLs).",
+            constraints="20s timeout. 1MB max response. HTML is converted to markdown-like text.",
+        ),
+    )
     async def web_fetch_default(params: FetchInput) -> str:
-        """Fetch URL and convert HTML to markdown-like text."""
+        """Fetch a URL and return its content as text.
+
+        Usage:
+        - HTML content is converted to markdown-like text for readability.
+        - 20-second timeout; responses larger than 1MB are truncated.
+        - HTTP URLs are automatically upgraded to HTTPS.
+        - Use web.search first to find relevant URLs, then web.fetch to read them.
+        - For local files, use fs.read instead.
+        """
         import aiohttp
 
         url = _normalize_url(params.url)
@@ -263,12 +518,26 @@ def register_builtin_tools(
             return f"{content}\n\n[truncated: response exceeded byte limit]"
         return content
 
-    @register(name="schedule.add", short_description="Add a cron schedule", model=ScheduleAddInput, context=True)
+    @register(
+        name="schedule.add",
+        short_description="Schedule a future or recurring reminder message",
+        model=ScheduleAddInput,
+        context=True,
+        guidance=ToolGuidance(
+            when_to_use="Setting reminders, polling at intervals, scheduling periodic checks or notifications.",
+            when_not_to="Immediate actions (just do them). Waiting for a bash command (use timeout_seconds instead).",
+            constraints="Exactly one of after_seconds, interval_seconds, or cron must be set. Messages are delivered to the current session.",
+        ),
+    )
     def schedule_add(params: ScheduleAddInput, context: ToolContext) -> str:
-        """Schedule a reminder message to be sent to current session in the future. You can specify either of the following scheduling options:
-        - after_seconds: run once after this many seconds from now
-        - interval_seconds: run repeatedly at this interval
-        - cron: run with cron expression in crontab format: minute hour day month day_of_week
+        """Schedule a reminder message to be sent to the current session in the future.
+
+        Scheduling options (specify exactly one):
+        - after_seconds: run once after N seconds from now (one-shot timer)
+        - interval_seconds: run repeatedly at this interval (periodic)
+        - cron: crontab format 'minute hour day month day_of_week' (e.g. '*/5 * * * *' for every 5 min)
+
+        The message will be delivered as a user message to the current session when triggered.
         """
         job_id = str(uuid.uuid4())[:8]
         if params.after_seconds is not None:
@@ -418,15 +687,54 @@ def register_builtin_tools(
         """Expand one tool description and schema."""
         return registry.detail(params.name)
 
-    @register(name="tape.handoff", short_description="Create anchor handoff", model=HandoffInput)
+    @register(
+        name="tape.handoff",
+        short_description="Checkpoint context and start a new conversation phase",
+        model=HandoffInput,
+        always_expand=True,
+        guidance=ToolGuidance(
+            when_to_use=(
+                "1. Context is getting long (>30 tool calls or >20 messages since last anchor). "
+                "2. Completed a logical phase of work and starting a new one. "
+                "3. A model call fails with context length error. "
+                "4. Before delegating to a sub-agent that needs a clean starting point."
+            ),
+            when_not_to=(
+                "1. In the middle of an active debugging session where recent context is critical. "
+                "2. Only a few messages have been exchanged since the last anchor."
+            ),
+            constraints=(
+                "After handoff, ALL messages before the anchor are dropped from context. "
+                "Only the handoff state (summary, next_steps, files_modified, decisions) survives as a system message. "
+                "Write SELF-CONTAINED summaries: a reader with no prior context must understand what was done. "
+                "Always include file paths for modified files. After handoff, re-read files before modifying them."
+            ),
+        ),
+    )
     async def handoff(params: HandoffInput) -> str:
-        """Create tape anchor with optional summary and next_steps state."""
+        """Create a context checkpoint (anchor) that resets the conversation window.
+
+        After this call, ALL messages before the anchor are permanently dropped from LLM context.
+        Only the handoff state fields survive as a system message in the next phase:
+        - summary: what was accomplished (required for useful handoffs)
+        - next_steps: what to do next
+        - files_modified: paths that were changed
+        - decisions: key choices made and why
+
+        The summary must be SELF-CONTAINED: a reader with zero prior context must understand
+        what was done, what files were touched, and what to do next. After handoff, always
+        re-read files before modifying them — do not rely on memory of file contents.
+        """
         anchor_name = params.name or "handoff"
         state: dict[str, object] = {}
         if params.summary:
             state["summary"] = params.summary
         if params.next_steps:
             state["next_steps"] = params.next_steps
+        if params.files_modified:
+            state["files_modified"] = params.files_modified
+        if params.decisions:
+            state["decisions"] = params.decisions
         await tape.handoff(anchor_name, state=state or None)
         return f"handoff created: {anchor_name}"
 
@@ -438,9 +746,20 @@ def register_builtin_tools(
             rows.append(f"{anchor.name} state={json.dumps(anchor.state, ensure_ascii=False)}")
         return "\n".join(rows) if rows else "(no anchors)"
 
-    @register(name="tape.info", short_description="Show tape summary", model=EmptyInput)
+    @register(
+        name="tape.info",
+        short_description="Show tape context size and anchor status",
+        model=EmptyInput,
+        guidance=ToolGuidance(
+            when_to_use="Checking how much context has been used. Deciding whether a tape.handoff is needed.",
+            when_not_to="No need to check routinely — check when context feels large or before a complex phase.",
+        ),
+    )
     async def tape_info(_params: EmptyInput) -> str:
-        """Show tape summary with entry and anchor counts."""
+        """Show tape summary: entry count, anchor count, entries since last anchor, and token usage estimate.
+
+        Use this to decide whether a tape.handoff checkpoint is needed (e.g. entries_since_last_anchor > 30).
+        """
         info = await tape.info()
         return "\n".join((
             f"tape={info.name}",
@@ -451,9 +770,17 @@ def register_builtin_tools(
             f"last_token_usage={info.last_token_usage or 'unknown'}",
         ))
 
-    @register(name="tape.search", short_description="Search tape entries", model=TapeSearchInput)
+    @register(
+        name="tape.search",
+        short_description="Search conversation history by keyword",
+        model=TapeSearchInput,
+        guidance=ToolGuidance(
+            when_to_use="Finding previous tool results, user messages, or decisions from earlier in the conversation.",
+            when_not_to="Searching file contents (use fs.grep). Searching for files (use fs.glob).",
+        ),
+    )
     async def tape_search(params: TapeSearchInput) -> str:
-        """Search entries in tape by query. In reverse order."""
+        """Search entries in the conversation tape by keyword query. Results are returned in reverse chronological order."""
         entries = await tape.search(params.query, limit=params.limit)
         if not entries:
             return "(no matches)"
