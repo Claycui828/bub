@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -48,13 +47,18 @@ class McpToolInfo:
 
 
 class McpClientManager:
-    """Manages connections to multiple MCP servers and exposes their tools."""
+    """Manages connections to multiple MCP servers and exposes their tools.
+
+    Stdio servers maintain a persistent subprocess + session.
+    HTTP servers reconnect per call (stateless, no cross-task context issues).
+    """
 
     def __init__(self, configs: list[McpServerConfig]) -> None:
         self._configs = configs
-        self._sessions: dict[str, ClientSession] = {}
+        self._stdio_sessions: dict[str, ClientSession] = {}
+        self._http_configs: dict[str, McpServerConfig] = {}
         self._tools: dict[str, McpToolInfo] = {}  # keyed by "mcp__{server}__{tool}"
-        self._cleanup_tasks: list[Any] = []  # context manager stacks
+        self._cleanup_tasks: list[Any] = []  # stdio context managers
 
     @property
     def available(self) -> bool:
@@ -69,14 +73,13 @@ class McpClientManager:
             logger.warning("mcp.client.skip: mcp package not installed, run: uv add mcp")
             return []
 
-        tasks = [self._connect_one(cfg) for cfg in self._configs]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
         all_tools: list[McpToolInfo] = []
-        for cfg, result in zip(self._configs, results, strict=True):
-            if isinstance(result, Exception):
-                logger.error("mcp.client.connect.error server={} error={}", cfg.name, result)
-            elif result:
-                all_tools.extend(result)
+        for cfg in self._configs:
+            try:
+                tools = await self._connect_one(cfg)
+                all_tools.extend(tools)
+            except BaseException as exc:
+                logger.error("mcp.client.connect.error server={} error={}", cfg.name, exc)
         return all_tools
 
     async def _connect_one(self, cfg: McpServerConfig) -> list[McpToolInfo]:
@@ -88,41 +91,56 @@ class McpClientManager:
         return await self._connect_stdio(cfg)
 
     async def _connect_stdio(self, cfg: McpServerConfig) -> list[McpToolInfo]:
-        """Connect via stdio transport."""
+        """Connect via stdio transport (persistent subprocess)."""
         server_params = StdioServerParameters(
             command=cfg.command or "uvx",
             args=cfg.args,
             env=cfg.env or None,
         )
-        # We need to keep the context managers alive for the session lifetime.
-        # Use asyncio tasks to manage the lifecycle.
-        read_stream, write_stream = await self._open_stdio(server_params)
-        session = ClientSession(read_stream, write_stream)
-        await session.__aenter__()
-        await session.initialize()
-        self._sessions[cfg.name] = session
-        return await self._discover_tools(cfg.name, session)
-
-    async def _open_stdio(self, params: StdioServerParameters) -> tuple[Any, Any]:
-        """Open stdio transport and keep context alive."""
-        cm = stdio_client(params)
+        cm = stdio_client(server_params)
         read_stream, write_stream = await cm.__aenter__()
         self._cleanup_tasks.append(cm)
-        return read_stream, write_stream
-
-    async def _connect_http(self, cfg: McpServerConfig) -> list[McpToolInfo]:
-        """Connect via streamable HTTP transport."""
-        cm = streamable_http_client(cfg.url)
-        read_stream, write_stream, _ = await cm.__aenter__()
-        self._cleanup_tasks.append(cm)
         session = ClientSession(read_stream, write_stream)
         await session.__aenter__()
         await session.initialize()
-        self._sessions[cfg.name] = session
+        self._stdio_sessions[cfg.name] = session
         return await self._discover_tools(cfg.name, session)
 
+    async def _connect_http(self, cfg: McpServerConfig) -> list[McpToolInfo]:
+        """Discover tools from an HTTP MCP server (stateless, reconnects per call)."""
+        tools = await self._http_session_call(cfg.url, self._list_tools_callback)
+        self._http_configs[cfg.name] = cfg
+        result: list[McpToolInfo] = []
+        for tool in tools:
+            qualified_name = f"mcp__{cfg.name}__{tool.name}"
+            info = McpToolInfo(
+                server_name=cfg.name,
+                tool_name=tool.name,
+                description=tool.description or "",
+                input_schema=tool.inputSchema if isinstance(tool.inputSchema, dict) else {},
+            )
+            self._tools[qualified_name] = info
+            result.append(info)
+            logger.info("mcp.client.tool.discovered server={} tool={}", cfg.name, tool.name)
+        return result
+
+    @staticmethod
+    async def _list_tools_callback(session: ClientSession) -> list[Any]:
+        result = await session.list_tools()
+        return list(result.tools)
+
+    @staticmethod
+    async def _http_session_call(url: str, callback: Any) -> Any:
+        """Open a short-lived HTTP session, run callback, and close cleanly."""
+        async with (
+            streamable_http_client(url) as (read_stream, write_stream, _),
+            ClientSession(read_stream, write_stream) as session,
+        ):
+            await session.initialize()
+            return await callback(session)
+
     async def _discover_tools(self, server_name: str, session: ClientSession) -> list[McpToolInfo]:
-        """List tools from a connected MCP session."""
+        """List tools from a connected stdio session."""
         result = await session.list_tools()
         tools: list[McpToolInfo] = []
         for tool in result.tools:
@@ -140,16 +158,35 @@ class McpClientManager:
 
     async def call_tool(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> str:
         """Call a tool on a connected MCP server."""
-        session = self._sessions.get(server_name)
-        if session is None:
-            return f"error: MCP server '{server_name}' not connected"
+        # Stdio: use persistent session
+        session = self._stdio_sessions.get(server_name)
+        if session is not None:
+            return await self._execute_tool(session, tool_name, arguments)
 
+        # HTTP: reconnect per call
+        cfg = self._http_configs.get(server_name)
+        if cfg is not None:
+            return await self._call_http_tool(cfg.url, tool_name, arguments)
+
+        return f"error: MCP server '{server_name}' not connected"
+
+    async def _call_http_tool(self, url: str, tool_name: str, arguments: dict[str, Any]) -> str:
+        """Call a tool via a short-lived HTTP session."""
+        try:
+            async def _callback(session: ClientSession) -> str:
+                return await self._execute_tool(session, tool_name, arguments)
+            return await self._http_session_call(url, _callback)
+        except Exception as exc:
+            return f"mcp error: {exc!s}"
+
+    @staticmethod
+    async def _execute_tool(session: ClientSession, tool_name: str, arguments: dict[str, Any]) -> str:
+        """Execute a tool call and format the result."""
         try:
             result = await session.call_tool(tool_name, arguments=arguments)
         except Exception as exc:
             return f"mcp error: {exc!s}"
 
-        # Extract text content from result
         parts: list[str] = []
         for content in result.content:
             if isinstance(content, mcp_types.TextContent):
@@ -173,8 +210,8 @@ class McpClientManager:
         return list(self._tools.items())
 
     async def close(self) -> None:
-        """Disconnect all MCP sessions."""
-        for name, session in self._sessions.items():
+        """Disconnect all stdio sessions (HTTP sessions are stateless)."""
+        for name, session in self._stdio_sessions.items():
             try:
                 await session.__aexit__(None, None, None)
             except Exception:
@@ -186,7 +223,8 @@ class McpClientManager:
             except Exception:
                 logger.warning("mcp.client.transport.close.error")
 
-        self._sessions.clear()
+        self._stdio_sessions.clear()
+        self._http_configs.clear()
         self._tools.clear()
         self._cleanup_tasks.clear()
         logger.info("mcp.client.closed")
