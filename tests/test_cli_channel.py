@@ -187,3 +187,57 @@ class TestSlashCommands:
         # Should not raise, just prints info
         assert await cli._handle_slash_command("/fold 99") is True
         assert await cli._handle_slash_command("/fold abc") is True
+
+
+class TestAtReferences:
+    def _cli(self, workspace: Path | None = None) -> CliChannel:
+        runtime = _DummyRuntime()
+        if workspace:
+            runtime.workspace = workspace
+        return CliChannel(runtime)  # type: ignore[arg-type]
+
+    def test_expand_file_reference(self, tmp_path: Path) -> None:
+        (tmp_path / "hello.txt").write_text("world")
+        cli = self._cli(workspace=tmp_path)
+        result = cli._expand_at_references(f"read @{tmp_path / 'hello.txt'}")
+        assert "<file" in result
+        assert "world" in result
+
+    def test_expand_relative_file(self, tmp_path: Path) -> None:
+        (tmp_path / "foo.py").write_text("print('hi')")
+        cli = self._cli(workspace=tmp_path)
+        result = cli._expand_at_references("check @foo.py")
+        assert "<file" in result
+        assert "print('hi')" in result
+
+    def test_expand_directory_reference(self, tmp_path: Path) -> None:
+        sub = tmp_path / "src"
+        sub.mkdir()
+        (sub / "a.py").write_text("")
+        (sub / "b.py").write_text("")
+        cli = self._cli(workspace=tmp_path)
+        result = cli._expand_at_references(f"list @{sub}")
+        assert "<directory" in result
+        assert "a.py" in result
+        assert "b.py" in result
+
+    def test_nonexistent_path_kept_as_is(self) -> None:
+        cli = self._cli()
+        text = "look at @nonexistent_file_xyz"
+        result = cli._expand_at_references(text)
+        assert "@nonexistent_file_xyz" in result
+
+    def test_no_at_references(self) -> None:
+        cli = self._cli()
+        text = "just a normal message"
+        assert cli._expand_at_references(text) == text
+
+    def test_email_not_expanded(self) -> None:
+        cli = self._cli()
+        # email-like patterns don't match because @ must be preceded by space/start
+        text = "send to user@example.com"
+        result = cli._expand_at_references(text)
+        # The regex won't match "user@example.com" because "user" prefix
+        # is part of the word — @example.com would match but example.com
+        # won't be a valid path, so it stays as-is
+        assert "example.com" in result

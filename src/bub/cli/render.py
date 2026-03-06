@@ -119,7 +119,7 @@ class CliRenderer:
         agent_id = data.get("agent_id", "")
         self._add_panel(
             f"Sub-agent: {desc}",
-            f"agent_id: {agent_id}\nprompt: {data.get('prompt', '')[:200]}",
+            f"agent_id: {agent_id}\nprompt: {data.get('prompt', '')}",
             "magenta",
             kind="sub_agent",
             metadata={"agent_id": agent_id},
@@ -128,7 +128,7 @@ class CliRenderer:
     def _render_sub_agent_end(self, data: dict) -> None:
         agent_id = data.get("agent_id", "")
         status = data.get("status", "")
-        result = data.get("result", "")[:500]
+        result = data.get("result", "")
         style = "green" if status == "completed" else "red"
         self._add_panel(
             f"Sub-agent {agent_id} [{status}]",

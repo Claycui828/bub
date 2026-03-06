@@ -112,6 +112,8 @@ class CliChannel(BaseChannel[str]):
 
                 # Launch agent as a background task so the input loop continues.
                 request = self._normalize_input(raw)
+                request = self._expand_at_references(request)
+                self._display_user_input(raw)
                 self._agent_running = True
                 self._agent_task = asyncio.create_task(self._run_agent(on_receive, request))
 
@@ -266,6 +268,46 @@ class CliChannel(BaseChannel[str]):
             f"last:{getattr(info, 'last_anchor', None) or '-'}"
         )
         return FormattedText([("", f"{left}  {right}")])
+
+    def _display_user_input(self, raw: str) -> None:
+        """Show user input in a compact form — collapse long pastes."""
+        lines = raw.splitlines()
+        if len(lines) > 5:
+            preview = "\n".join(lines[:3])
+            self._renderer.info(f"{preview}\n[... pasted {len(lines)} lines total]")
+
+    def _expand_at_references(self, text: str) -> str:
+        """Expand @file and @folder references to inline content."""
+        import re
+
+        def _replace(match: re.Match[str]) -> str:
+            path_str = match.group(1)
+            p = Path(path_str).expanduser()
+            if not p.is_absolute():
+                p = self.runtime.workspace / p
+            if p.is_file():
+                try:
+                    content = p.read_text(encoding="utf-8", errors="replace")
+                except Exception as exc:
+                    return f"[error reading {p}: {exc}]"
+                else:
+                    return f"\n<file path=\"{p}\">\n{content}\n</file>\n"
+            elif p.is_dir():
+                try:
+                    entries = sorted(p.iterdir())
+                except Exception as exc:
+                    return f"[error listing {p}: {exc}]"
+                else:
+                    listing = "\n".join(
+                        f"  {'d' if e.is_dir() else 'f'} {e.name}" for e in entries[:100]
+                    )
+                    if len(entries) > 100:
+                        listing += f"\n  ... ({len(entries)} entries total)"
+                    return f"\n<directory path=\"{p}\">\n{listing}\n</directory>\n"
+            else:
+                return match.group(0)  # not a valid path, keep original
+
+        return re.sub(r"@([\w/.~-]+(?:[\w/.-]+)*)", _replace, text)
 
     def _normalize_input(self, raw: str) -> str:
         if self._mode != "shell":
