@@ -8,14 +8,11 @@ import pytest
 
 from bub.observability.tracer import (
     GenerationSpan,
-    NullBackend,
     NullTracer,
     Span,
     Tracer,
-    TracerBackend,
     _current_span,
     _gen_id,
-    _push_span,
     _span_parents,
     current_tracer,
     set_tracer,
@@ -140,10 +137,9 @@ class TestTracerContextPropagation:
         backend = RecordingBackend()
         tracer = Tracer(backend)
 
-        with tracer.trace("root"):
-            with tracer.generation("llm.chat", model="gpt-4") as gen:
-                assert _current_span.get() is gen
-                gen.end(output="hello", usage={"total_tokens": 42})
+        with tracer.trace("root"), tracer.generation("llm.chat", model="gpt-4") as gen:
+            assert _current_span.get() is gen
+            gen.end(output="hello", usage={"total_tokens": 42})
 
         gen_events = [e for e in backend.events if e[0] == "end_generation"]
         assert len(gen_events) == 1
@@ -155,10 +151,8 @@ class TestSpanContextManager:
         backend = RecordingBackend()
         tracer = Tracer(backend)
 
-        with pytest.raises(ValueError, match="boom"):
-            with tracer.trace("root"):
-                with tracer.span("will-fail"):
-                    raise ValueError("boom")
+        with pytest.raises(ValueError, match="boom"), tracer.trace("root"), tracer.span("will-fail"):
+            raise ValueError("boom")
 
         end_events = [e for e in backend.events if e[0] == "end_span"]
         # Both spans should be ended: child (error) + root (error).

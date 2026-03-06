@@ -71,6 +71,17 @@ class TapeService:
             _tape_context.reset(reset_token)
             logger.info("Merged forked tape '{}' back into '{}'", fork_name, self._tape.name)
 
+    def last_anchor_state(self) -> dict[str, Any] | None:
+        """Return the state dict from the most recent anchor, or None."""
+        entries = self._store.read(self._tape.name)
+        if not entries:
+            return None
+        for entry in reversed(entries):
+            if entry.kind == "anchor":
+                state = entry.payload.get("state")
+                return dict(state) if isinstance(state, dict) and state else None
+        return None
+
     async def ensure_bootstrap_anchor(self) -> None:
         if self._bootstrapped:
             return
@@ -78,7 +89,9 @@ class TapeService:
         anchors = list(await self._tape.query_async.kinds("anchor").all())
         if anchors:
             return
-        await self.handoff("session/start", state={"owner": "human"})
+        # Write directly to self._tape (not self.tape property) to avoid
+        # inheriting a parent session's _tape_context in nested agent calls.
+        await self._tape.handoff_async("session/start", state={"owner": "human"})
 
     async def handoff(self, name: str, *, state: dict[str, Any] | None = None) -> list[TapeEntry]:
         return cast(list[TapeEntry], await self.tape.handoff_async(name, state=state))

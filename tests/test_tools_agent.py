@@ -2,25 +2,28 @@ import asyncio
 import inspect
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock
 
 import pytest
 from republic import ToolContext
 
-from bub.tools.agent import AgentManager, get_agent_manager, register_agent_tools
+from bub.tools.agent import get_agent_manager, register_agent_tools
 from bub.tools.registry import ToolRegistry
 
 
 @dataclass
 class _FakeLoopResult:
-    visible_text: str = ""
+    assistant_output: str = ""
     error: str | None = None
 
 
 class _FakeRuntime:
     def __init__(self) -> None:
         self._sessions: dict[str, Any] = {}
-        self.handle_input = AsyncMock(return_value=_FakeLoopResult(visible_text="sub-agent done"))
+        self.handle_input = AsyncMock(return_value=_FakeLoopResult(assistant_output="sub-agent done"))
+
+    def remove_session(self, session_id: str, *, keep_tape: bool = True) -> None:
+        self._sessions.pop(session_id, None)
 
 
 def _build_registry(runtime: _FakeRuntime) -> ToolRegistry:
@@ -72,7 +75,7 @@ class TestAgentDelegation:
     @pytest.mark.asyncio
     async def test_foreground_with_error(self) -> None:
         runtime = _FakeRuntime()
-        runtime.handle_input = AsyncMock(return_value=_FakeLoopResult(visible_text="", error="timeout"))
+        runtime.handle_input = AsyncMock(return_value=_FakeLoopResult(assistant_output="", error="timeout"))
         registry = _build_registry(runtime)
 
         result = await _run(registry, "agent", context=_ctx(), prompt="slow task", description="slow")
@@ -83,7 +86,7 @@ class TestAgentDelegation:
     async def test_foreground_partial_output_with_error(self) -> None:
         runtime = _FakeRuntime()
         runtime.handle_input = AsyncMock(
-            return_value=_FakeLoopResult(visible_text="partial", error="max_steps")
+            return_value=_FakeLoopResult(assistant_output="partial", error="max_steps")
         )
         registry = _build_registry(runtime)
 
@@ -95,7 +98,7 @@ class TestAgentDelegation:
     @pytest.mark.asyncio
     async def test_foreground_empty_output(self) -> None:
         runtime = _FakeRuntime()
-        runtime.handle_input = AsyncMock(return_value=_FakeLoopResult(visible_text=""))
+        runtime.handle_input = AsyncMock(return_value=_FakeLoopResult(assistant_output=""))
         registry = _build_registry(runtime)
 
         result = await _run(registry, "agent", context=_ctx(), prompt="quiet", description="quiet")
@@ -151,7 +154,7 @@ class TestAgentBackground:
         # Make handle_input slow so we can verify it returns before completion.
         async def slow_input(*args: Any, **kwargs: Any) -> _FakeLoopResult:
             await asyncio.sleep(0.5)
-            return _FakeLoopResult(visible_text="bg done")
+            return _FakeLoopResult(assistant_output="bg done")
 
         runtime.handle_input = AsyncMock(side_effect=slow_input)
         registry = _build_registry(runtime)
@@ -178,7 +181,7 @@ class TestAgentBackground:
     @pytest.mark.asyncio
     async def test_background_error_captured(self) -> None:
         runtime = _FakeRuntime()
-        runtime.handle_input = AsyncMock(return_value=_FakeLoopResult(visible_text="", error="crash"))
+        runtime.handle_input = AsyncMock(return_value=_FakeLoopResult(assistant_output="", error="crash"))
         registry = _build_registry(runtime)
 
         await _run(
@@ -209,7 +212,7 @@ class TestAgentResume:
         assert "agent-1" in result1
 
         # Resume with follow-up prompt.
-        runtime.handle_input = AsyncMock(return_value=_FakeLoopResult(visible_text="continued result"))
+        runtime.handle_input = AsyncMock(return_value=_FakeLoopResult(assistant_output="continued result"))
         result2 = await _run(
             registry, "agent", context=_ctx(),
             prompt="now summarize", description="summarize", resume="agent-1",
@@ -218,7 +221,7 @@ class TestAgentResume:
         assert "continued result" in result2
         # Verify same session_id was reused.
         session_id_used = runtime.handle_input.call_args[0][0]
-        assert "sess1:sub:agent-1" == session_id_used
+        assert session_id_used == "sess1:sub:agent-1"
 
     @pytest.mark.asyncio
     async def test_resume_not_found(self) -> None:
@@ -236,7 +239,7 @@ class TestAgentResume:
         runtime = _FakeRuntime()
         async def slow(*args: Any, **kwargs: Any) -> _FakeLoopResult:
             await asyncio.sleep(10)
-            return _FakeLoopResult(visible_text="done")
+            return _FakeLoopResult(assistant_output="done")
 
         runtime.handle_input = AsyncMock(side_effect=slow)
         registry = _build_registry(runtime)

@@ -51,9 +51,17 @@ class DummyRuntime:
 
                 return _Info()
 
+        class _ModelRunner:
+            def set_live_callback(self, cb):
+                pass
+
+            def inject_message(self, text):
+                pass
+
         class _Session:
             tape = _Tape()
             tool_view = type("_ToolView", (), {"all_tools": staticmethod(lambda: [])})()
+            model_runner = _ModelRunner()
 
         return _Session()
 

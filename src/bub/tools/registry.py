@@ -16,6 +16,9 @@ from loguru import logger
 from pydantic import BaseModel
 from republic import Tool, ToolContext, tool_from_model
 
+# Type for live output callback: (event_type, data)
+LiveCallback = Callable[[str, dict[str, Any]], None]
+
 
 def _shorten_text(text: str, width: int = 30, placeholder: str = "...") -> str:
     """Shorten text to width characters, cutting in the middle of words if needed.
@@ -35,6 +38,16 @@ def _shorten_text(text: str, width: int = 30, placeholder: str = "...") -> str:
 
 
 @dataclass(frozen=True)
+class ToolGuidance:
+    """Structured usage guidance for a tool."""
+
+    when_to_use: str = ""
+    when_not_to: str = ""
+    examples: str = ""
+    constraints: str = ""
+
+
+@dataclass(frozen=True)
 class ToolDescriptor:
     """Tool metadata and runtime handle."""
 
@@ -43,6 +56,8 @@ class ToolDescriptor:
     detail: str
     tool: Tool
     source: str = "builtin"
+    always_expand: bool = False
+    guidance: ToolGuidance | None = None
 
 
 class ToolRegistry:
@@ -51,6 +66,15 @@ class ToolRegistry:
     def __init__(self, allowed_tools: set[str] | None = None) -> None:
         self._tools: dict[str, ToolDescriptor] = {}
         self._allowed_tools = allowed_tools
+        self._live_callback: LiveCallback | None = None
+
+    def set_live_callback(self, callback: LiveCallback | None) -> None:
+        """Set callback for tool execution live events."""
+        self._live_callback = callback
+
+    def _emit_live(self, event: str, data: dict[str, Any]) -> None:
+        if self._live_callback:
+            self._live_callback(event, data)
 
     def register(
         self,
@@ -61,6 +85,8 @@ class ToolRegistry:
         model: type[BaseModel] | None = None,
         context: bool = False,
         source: str = "builtin",
+        always_expand: bool = False,
+        guidance: ToolGuidance | None = None,
     ) -> Callable[[Callable], ToolDescriptor | None]:
         def decorator[**P, T](func: Callable[P, T | Awaitable[T]]) -> ToolDescriptor | None:
             tool_detail = detail or func.__doc__ or ""
@@ -98,7 +124,8 @@ class ToolRegistry:
             else:
                 tool = Tool.from_callable(handler, name=name, description=short_description, context=context)
             tool_desc = ToolDescriptor(
-                name=name, short_description=short_description, detail=tool_detail, tool=tool, source=source
+                name=name, short_description=short_description, detail=tool_detail, tool=tool, source=source,
+                always_expand=always_expand, guidance=guidance,
             )
             self._tools[name] = tool_desc
             return tool_desc
@@ -145,14 +172,24 @@ class ToolRegistry:
             if display_name != descriptor.name:
                 command_name_line = f"command_name: {descriptor.name}\n"
 
-        return (
-            f"name: {display_name}\n"
-            f"{command_name_line}"
-            f"source: {descriptor.source}\n"
-            f"description: {descriptor.short_description}\n"
-            f"detail: {descriptor.detail}\n"
-            f"schema: {schema}"
-        )
+        lines = [
+            f"name: {display_name}",
+            f"{command_name_line}source: {descriptor.source}" if command_name_line else f"source: {descriptor.source}",
+            f"description: {descriptor.short_description}",
+            f"detail: {descriptor.detail}",
+        ]
+        if descriptor.guidance:
+            g = descriptor.guidance
+            if g.when_to_use:
+                lines.append(f"when_to_use: {g.when_to_use}")
+            if g.when_not_to:
+                lines.append(f"when_not_to: {g.when_not_to}")
+            if g.examples:
+                lines.append(f"examples: {g.examples}")
+            if g.constraints:
+                lines.append(f"constraints: {g.constraints}")
+        lines.append(f"schema: {schema}")
+        return "\n".join(lines)
 
     def model_tools(self) -> builtins.list[Tool]:
         tools: builtins.list[Tool] = []
@@ -206,8 +243,15 @@ class ToolRegistry:
         if descriptor is None:
             raise KeyError(name)
 
-        tracer = current_tracer()
+        # Build a human-readable args summary for live display.
         call_kwargs = {key: value for key, value in kwargs.items() if key != "context"}
+        args_summary = ", ".join(
+            f"{k}={_shorten_text(str(v), width=40)}" for k, v in call_kwargs.items()
+        )
+        self._emit_live("tool.start", {"name": name, "args_summary": args_summary})
+
+        tracer = current_tracer()
+        start_time = time.monotonic()
         with tracer.span(f"tool.{name}", input=call_kwargs, metadata={"source": descriptor.source}) as span:
             if descriptor.tool.context:
                 kwargs["context"] = context
@@ -215,8 +259,32 @@ class ToolRegistry:
                 result = descriptor.tool.run(**kwargs)
                 if inspect.isawaitable(result):
                     result = await result
-                span.end(output=str(result)[:2048] if result else None)
-                return result
             except Exception as exc:
+                elapsed_ms = (time.monotonic() - start_time) * 1000
                 span.end(output=str(exc), level="ERROR")
+                self._emit_live("tool.error", {
+                    "name": name,
+                    "error": _shorten_text(str(exc), width=80),
+                    "elapsed_ms": elapsed_ms,
+                })
                 raise
+            else:
+                elapsed_ms = (time.monotonic() - start_time) * 1000
+                span.end(output=str(result)[:4096] if result else None)
+
+                # Build output preview for live display.
+                output_str = str(result) if result else ""
+                lines = output_str.splitlines()
+                if len(lines) > 1:
+                    preview = f"{len(lines)} lines"
+                elif len(output_str) > 80:
+                    preview = f"{len(output_str)} chars"
+                else:
+                    preview = _shorten_text(output_str, width=60)
+                self._emit_live("tool.end", {
+                    "name": name,
+                    "status": "ok",
+                    "elapsed_ms": elapsed_ms,
+                    "output_preview": preview,
+                })
+                return result

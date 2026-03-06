@@ -50,15 +50,25 @@ class SessionRuntime:
     tool_view: ProgressiveToolView
 
     async def handle_input(self, text: str) -> LoopResult:
+        from bub.tape.context import HANDOFF_STATE_KEY
+
         await self.tape.ensure_bootstrap_anchor()
         with self.tape.fork_tape() as tape:
-            tape.context = default_tape_context({"session_id": self.session_id})
+            ctx_state: dict[str, object] = {"session_id": self.session_id}
+            anchor_state = self.tape.last_anchor_state()
+            if anchor_state:
+                ctx_state[HANDOFF_STATE_KEY] = anchor_state
+            tape.context = default_tape_context(ctx_state)
             return await self.loop.handle_input(text)
 
     def reset_context(self) -> None:
         """Clear volatile in-memory context while keeping the same session identity."""
         self.model_runner.reset_context()
         self.tool_view.reset()
+
+    def inject_message(self, text: str) -> None:
+        """Queue a user message to be injected into the agent's next loop step."""
+        self.model_runner.inject_message(text)
 
 
 class AppRuntime:
@@ -95,7 +105,29 @@ class AppRuntime:
     def __enter__(self) -> AppRuntime:
         if not self.scheduler.running and self._enable_scheduler:
             self.scheduler.start()
+            self._register_tape_cleanup_job()
         return self
+
+    def _register_tape_cleanup_job(self) -> None:
+        """Register a weekly job to clean up stale sub-agent tapes."""
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        job_id = "bub.tape.cleanup"
+        if self.scheduler.get_job(job_id):
+            return
+        self.scheduler.add_job(
+            _run_tape_cleanup,
+            trigger=IntervalTrigger(weeks=1),
+            id=job_id,
+            kwargs={
+                "home": str(self.settings.resolve_home()),
+                "workspace": str(self.workspace),
+                "max_age_days": 7,
+            },
+            coalesce=True,
+            max_instances=1,
+            replace_existing=True,
+        )
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if self.scheduler.running and self._enable_scheduler:
@@ -189,11 +221,14 @@ class AppRuntime:
             try:
                 result = await task
                 trace_span.end(
-                    output=result.assistant_output[:2048] if result.assistant_output else None,
+                    output=result.assistant_output[:4096] if result.assistant_output else None,
                     metadata={"steps": result.steps, "error": result.error},
                     level="ERROR" if result.error else "DEFAULT",
                 )
                 return result
+            except Exception as exc:
+                trace_span.end(output=f"exception: {exc!s}", level="ERROR")
+                raise
             finally:
                 self._active_inputs.discard(task)
                 tracer.flush()
@@ -208,6 +243,20 @@ class AppRuntime:
                 await task
             count += 1
         return count
+
+    def remove_session(self, session_id: str, *, keep_tape: bool = True) -> None:
+        """Remove a session from memory, optionally preserving its tape on disk.
+
+        keep_tape=True (default): only frees in-memory objects; tape file stays
+        on disk so resume can rebuild the session with full history.
+        keep_tape=False: also deletes the tape file.
+        """
+        session = self._sessions.pop(session_id, None)
+        if session is None:
+            return
+        if not keep_tape:
+            self._store.reset(session.tape._tape.name)
+        logger.info("session.removed session_id={} keep_tape={}", session_id, keep_tape)
 
     def reset_session_context(self, session_id: str) -> None:
         """Reset volatile context for an already-created session."""
@@ -260,6 +309,16 @@ class AppRuntime:
             default_channels=channel_manager.default_channels,
         )
         module.install(hooks_context)
+
+
+def _run_tape_cleanup(home: str, workspace: str, max_age_days: int = 7) -> None:
+    """Standalone function for scheduled tape cleanup (must be picklable)."""
+    from bub.tape.store import FileTapeStore
+
+    store = FileTapeStore(Path(home), Path(workspace))
+    removed = store.cleanup_stale_tapes(max_age_days=max_age_days)
+    if removed:
+        logger.info("tape.cleanup.scheduled removed={} tapes", len(removed))
 
 
 def _normalize_name_set(raw: set[str] | None) -> set[str] | None:

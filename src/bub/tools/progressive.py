@@ -25,6 +25,11 @@ class ProgressiveToolView:
         """Clear expanded tool details for a fresh prompt context."""
         self.expanded.clear()
 
+    def _effective_expanded(self) -> set[str]:
+        """Return expanded set union with always-expanded tools."""
+        always = {d.name for d in self.registry.descriptors() if d.always_expand}
+        return self.expanded | always
+
     def note_hint(self, hint: str) -> bool:
         """Expand one tool when hint matches tool name (case-insensitive)."""
 
@@ -45,11 +50,12 @@ class ProgressiveToolView:
         return "\n".join(lines)
 
     def expanded_block(self) -> str:
-        if not self.expanded:
+        effective = self._effective_expanded()
+        if not effective:
             return ""
 
         lines = ["<tool_details>"]
-        for name in sorted(self.expanded):
+        for name in sorted(effective):
             model_name = self.registry.to_model_name(name)
             try:
                 detail = self.registry.detail(name, for_model=True)

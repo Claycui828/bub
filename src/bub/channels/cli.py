@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from hashlib import md5
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 from prompt_toolkit import PromptSession
@@ -18,12 +22,26 @@ from rich import get_console
 
 from bub.app.runtime import AppRuntime
 from bub.channels.base import BaseChannel
+from bub.cli.builtin_commands import register_builtin_commands
+from bub.cli.commands import CommandContext, CommandRegistry
 from bub.cli.render import CliRenderer
 from bub.core.agent_loop import LoopResult
 
+# Double Ctrl-C within this window triggers a force-cancel.
+_DOUBLE_CTRL_C_WINDOW = 1.5
+
 
 class CliChannel(BaseChannel[str]):
-    """Interactive terminal channel."""
+    """Interactive terminal channel with always-visible input prompt.
+
+    The input loop runs continuously. Agent execution happens in a background
+    task so the prompt stays visible at the bottom of the terminal at all times.
+    User input during agent execution is injected into the next agent step.
+
+    Interruption:
+        - Ctrl-C once: graceful stop (finishes current step, then exits loop)
+        - Ctrl-C twice (within 1.5s) or /stop: force-cancel the agent task
+    """
 
     name = "cli"
 
@@ -34,35 +52,129 @@ class CliChannel(BaseChannel[str]):
         self._renderer = CliRenderer(get_console())
         self._mode = "agent"
         self._last_tape_info: object | None = None
-        self._prompt = self._build_prompt()
         self._stop_requested = False
+        self._agent_running = False
+        self._agent_task: asyncio.Task[None] | None = None
+        self._on_receive: Callable[[str], Awaitable[None]] | None = None
+        self._last_interrupt: float = 0.0
+
+        # Slash command registry.
+        self._command_registry = CommandRegistry()
+        register_builtin_commands(self._command_registry)
+
+        # Build prompt after registry is ready (needs tool names).
+        self._prompt = self._build_prompt()
+
+        # Wire up live callback for step/sub-agent/tool visibility.
+        self._session.model_runner.set_live_callback(self._on_live_event)
+
+    @property
+    def command_registry(self) -> CommandRegistry:
+        return self._command_registry
 
     @property
     def debounce_enabled(self) -> bool:
         return False
 
+    def _on_live_event(self, event: str, data: dict[str, Any]) -> None:
+        """Callback invoked by ModelRunner during execution."""
+        self._renderer.live_event(event, data)
+
     async def start(self, on_receive: Callable[[str], Awaitable[None]]) -> None:
+        self._on_receive = on_receive
         self._renderer.welcome(model=self.runtime.settings.model, workspace=str(self.runtime.workspace))
         await self._refresh_tape_info()
 
-        while not self._stop_requested:
-            try:
-                with patch_stdout(raw=True):
+        # Keep patch_stdout active for the entire session so the prompt
+        # always stays at the bottom, even while the agent prints output.
+        with patch_stdout(raw=True):
+            while not self._stop_requested:
+                try:
                     raw = (await self._prompt.prompt_async(self._prompt_message())).strip()
-            except KeyboardInterrupt:
-                self._renderer.info("Interrupted. Use ',quit' to exit.")
-                continue
-            except EOFError:
-                break
+                except KeyboardInterrupt:
+                    self._handle_interrupt()
+                    continue
+                except EOFError:
+                    break
 
-            if not raw:
-                continue
+                if not raw:
+                    continue
 
-            request = self._normalize_input(raw)
-            with self._renderer.console.status("[cyan]Processing...[/cyan]", spinner="dots"):
-                await on_receive(request)
+                # Handle slash commands.
+                if await self._handle_slash_command(raw):
+                    continue
+
+                # If agent is running, inject message into its loop.
+                if self._agent_running:
+                    self._session.inject_message(raw)
+                    self._renderer.info(f"Queued message (will be injected at next step): {raw}")
+                    continue
+
+                # Launch agent as a background task so the input loop continues.
+                request = self._normalize_input(raw)
+                self._agent_running = True
+                self._agent_task = asyncio.create_task(self._run_agent(on_receive, request))
 
         self._renderer.info("Bye.")
+
+    def _handle_interrupt(self) -> None:
+        """Handle Ctrl-C: graceful stop first, force-cancel on double press."""
+        now = time.monotonic()
+        if not self._agent_running:
+            self._renderer.info("No agent running. Press Ctrl-D to exit.")
+            return
+
+        if now - self._last_interrupt < _DOUBLE_CTRL_C_WINDOW:
+            # Double Ctrl-C -> force-cancel.
+            self.force_cancel()
+        else:
+            # First Ctrl-C -> graceful stop.
+            self._last_interrupt = now
+            self._session.model_runner.request_stop()
+            self._renderer.info("Stopping after current step... (Ctrl-C again to force-cancel)")
+
+    def force_cancel(self) -> None:
+        """Force-cancel the running agent task."""
+        if self._agent_task is not None and not self._agent_task.done():
+            self._agent_task.cancel()
+            self._renderer.info("Force-cancelled agent.")
+        self._last_interrupt = 0.0
+
+    async def _run_agent(self, on_receive: Callable[[str], Awaitable[None]], request: str) -> None:
+        """Execute the agent in the background, keeping the input loop free."""
+        try:
+            await on_receive(request)
+        except asyncio.CancelledError:
+            self._renderer.info("Agent cancelled.")
+        except Exception:
+            logger.exception("cli.agent.error")
+        finally:
+            self._agent_running = False
+            self._agent_task = None
+            # Refresh prompt symbol by invalidating the prompt app.
+            if self._prompt.app and self._prompt.app.is_running:
+                self._prompt.app.invalidate()
+
+    async def _handle_slash_command(self, raw: str) -> bool:
+        """Handle slash commands via the command registry. Returns True if handled."""
+        if not self._command_registry.is_command(raw):
+            return False
+
+        ctx = CommandContext(
+            renderer=self._renderer,
+            session=self._session,
+            channel=self,
+            agent_running=self._agent_running,
+        )
+        result = self._command_registry.execute(raw, ctx)
+
+        # Handle both sync and async results.
+        if inspect.isawaitable(result):
+            result = await result
+
+        if result is not None:
+            self._renderer.info(str(result))
+        return True
 
     def is_mentioned(self, message: str) -> bool:
         _ = message
@@ -108,8 +220,14 @@ class CliChannel(BaseChannel[str]):
         history_file = self._history_file(self.runtime.settings.resolve_home(), self.runtime.workspace)
         history_file.parent.mkdir(parents=True, exist_ok=True)
         history = FileHistory(str(history_file))
+
+        # Build completions: tool names (,prefix) + slash commands (/prefix).
         tool_names = sorted((f",{tool}" for tool in self._session.tool_view.all_tools()), key=_tool_sort_key)
-        completer = WordCompleter(tool_names, ignore_case=True)
+        slash_cmds = [f"/{cmd.name}" for cmd in self._command_registry.list_commands()]
+        slash_aliases = [f"/{a}" for cmd in self._command_registry.list_commands() for a in cmd.aliases]
+        completions = tool_names + slash_cmds + slash_aliases
+
+        completer = WordCompleter(completions, ignore_case=True)
         return PromptSession(
             completer=completer,
             complete_while_typing=True,
@@ -120,14 +238,28 @@ class CliChannel(BaseChannel[str]):
 
     def _prompt_message(self) -> FormattedText:
         cwd = Path.cwd().name
-        symbol = ">" if self._mode == "agent" else ","
+        if self._agent_running:
+            symbol = "\u21aa"
+        elif self._mode == "agent":
+            symbol = ">"
+        else:
+            symbol = ","
         return FormattedText([("bold", f"{cwd} {symbol} ")])
 
     def _render_bottom_toolbar(self) -> FormattedText:
         info = self._last_tape_info
         now = datetime.now().strftime("%H:%M")
         left = f"{now}  mode:{self._mode}"
+        if self._agent_running:
+            # Check for pause state.
+            paused = getattr(self._session.model_runner, "_paused", False)
+            if paused:
+                left += "  [paused]"
+            else:
+                left += "  [running]"
+        panels_count = len(self._renderer.panels)
         right = (
+            f"panels:{panels_count}  "
             f"model:{self.runtime.settings.model}  "
             f"entries:{getattr(info, 'entries', '-')} "
             f"anchors:{getattr(info, 'anchors', '-')} "

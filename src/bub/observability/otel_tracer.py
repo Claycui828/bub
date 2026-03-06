@@ -8,7 +8,6 @@ from loguru import logger
 
 from bub.observability.tracer import GenerationSpan, Span, TracerBackend, _gen_id
 
-
 # OpenTelemetry semantic conventions for GenAI.
 # See: https://opentelemetry.io/docs/specs/semconv/gen-ai/
 _ATTR_GEN_AI_SYSTEM = "gen_ai.system"

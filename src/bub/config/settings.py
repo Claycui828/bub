@@ -4,13 +4,35 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
+import yaml
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _load_yaml_config(workspace: Path | None = None) -> dict[str, Any]:
+    """Load YAML config from workspace or cwd, returns empty dict if not found."""
+    search_dirs = []
+    if workspace:
+        search_dirs.append(workspace)
+    search_dirs.append(Path.cwd())
+
+    for d in search_dirs:
+        for name in ("bub.yaml", "bub.yml"):
+            path = d / name
+            if path.is_file():
+                with open(path) as f:
+                    data = yaml.safe_load(f)
+                return data if isinstance(data, dict) else {}
+    return {}
+
+
 class Settings(BaseSettings):
-    """Runtime settings loaded from environment and .env files."""
+    """Runtime settings loaded from YAML, environment, and .env files.
+
+    Priority (highest wins): env vars > .env file > bub.yaml defaults.
+    """
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -80,9 +102,16 @@ class Settings(BaseSettings):
 
 
 def load_settings(workspace_path: Path | None = None) -> Settings:
-    """Load settings with optional workspace override."""
+    """Load settings with optional workspace override.
 
-    if workspace_path is None:
-        return Settings()
+    Loads bub.yaml from the workspace (or cwd) as base defaults,
+    then lets env vars and .env override on top.
+    """
+    yaml_data = _load_yaml_config(workspace_path)
 
-    return Settings(workspace_path=str(workspace_path.resolve()))
+    if workspace_path is not None:
+        yaml_data["workspace_path"] = str(workspace_path.resolve())
+
+    # Pass YAML values as init kwargs — pydantic-settings gives env vars
+    # higher priority than init values, so env/.env will override YAML.
+    return Settings(**yaml_data)

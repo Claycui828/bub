@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
 from loguru import logger
@@ -118,6 +117,8 @@ class LangfuseBackend(TracerBackend):
             update_kwargs["metadata"] = metadata
         if level != "DEFAULT":
             update_kwargs["level"] = level
+        if level == "ERROR" and output is not None:
+            update_kwargs["status_message"] = str(output)[:1024]
         if update_kwargs:
             handle.update(**update_kwargs)
         handle.end()
@@ -141,6 +142,8 @@ class LangfuseBackend(TracerBackend):
             update_kwargs["metadata"] = metadata
         if level != "DEFAULT":
             update_kwargs["level"] = level
+        if level == "ERROR" and output is not None:
+            update_kwargs["status_message"] = str(output)[:1024]
         if usage:
             update_kwargs["usage_details"] = usage
         if update_kwargs:

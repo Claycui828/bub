@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import quote, unquote
 
+from loguru import logger
 from republic.tape import InMemoryQueryMixin, TapeEntry
 
 TAPE_FILE_SUFFIX = ".jsonl"
@@ -161,6 +162,8 @@ class FileTapeStore(InMemoryQueryMixin):
         self._tape_files: dict[str, TapeFile] = {}
         self._fork_start_ids: dict[str, int] = {}
         self._lock = threading.Lock()
+        self._merge_locks: dict[str, threading.Lock] = {}
+        self._merge_lock_guard = threading.Lock()
 
     def list_tapes(self) -> list[str]:
         with self._lock:
@@ -181,12 +184,20 @@ class FileTapeStore(InMemoryQueryMixin):
         source_file.copy_to(target_file)
         return new_name
 
+    def _get_merge_lock(self, target: str) -> threading.Lock:
+        with self._merge_lock_guard:
+            if target not in self._merge_locks:
+                self._merge_locks[target] = threading.Lock()
+            return self._merge_locks[target]
+
     def merge(self, source: str, target: str) -> None:
-        source_file = self._tape_file(source)
-        target_file = self._tape_file(target)
-        target_file.copy_from(source_file)
-        source_file.path.unlink(missing_ok=True)
-        self._tape_files.pop(source, None)
+        lock = self._get_merge_lock(target)
+        with lock:
+            source_file = self._tape_file(source)
+            target_file = self._tape_file(target)
+            target_file.copy_from(source_file)
+            source_file.path.unlink(missing_ok=True)
+            self._tape_files.pop(source, None)
 
     def reset(self, tape: str) -> None:
         return self._tape_file(tape).reset()
@@ -211,6 +222,34 @@ class FileTapeStore(InMemoryQueryMixin):
             file_name = f"{self._paths.workspace_hash}__{encoded_name}{TAPE_FILE_SUFFIX}"
             self._tape_files[tape] = TapeFile(self._paths.tape_root / file_name)
         return self._tape_files[tape]
+
+    def cleanup_stale_tapes(self, *, max_age_days: int = 7) -> list[str]:
+        """Remove tape files that haven't been modified within max_age_days.
+
+        Only removes sub-agent fork tapes (names containing '__') to avoid
+        deleting active session tapes.
+        """
+        cutoff = datetime.now(UTC).timestamp() - max_age_days * 86400
+        removed: list[str] = []
+        prefix = f"{self._paths.workspace_hash}__"
+        for path in self._paths.tape_root.glob(f"{prefix}*{TAPE_FILE_SUFFIX}"):
+            encoded = path.name.removeprefix(prefix).removesuffix(TAPE_FILE_SUFFIX)
+            if not encoded:
+                continue
+            tape_name = unquote(encoded)
+            # Only clean up fork/sub-agent tapes (contain '__' separator).
+            if "__" not in tape_name and ":sub:" not in tape_name:
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff:
+                path.unlink(missing_ok=True)
+                self._tape_files.pop(tape_name, None)
+                removed.append(tape_name)
+                logger.info("tape.cleanup removed stale tape '{}' (age > {}d)", tape_name, max_age_days)
+        return removed
 
     @staticmethod
     def _resolve_paths(home: Path, workspace_path: Path) -> TapePaths:
