@@ -12,13 +12,98 @@ metadata:
 
 # Feishu Skill
 
-Agent-facing execution guide for Feishu outbound communication.
+## How to Send Messages
 
-Assumption: `BUB_FEISHU_APP_ID` and `BUB_FEISHU_APP_SECRET` are already configured.
+The sending script is at `scripts/feishu_send.py` relative to this SKILL.md file.
+To run it, use `cd` to the skill directory (parent of this SKILL.md), then call `uv run`:
+
+```bash
+cd <SKILL_DIR> && uv run scripts/feishu_send.py send --chat-id <CHAT_ID> --message "<TEXT>"
+```
+
+Where `<SKILL_DIR>` is the directory containing this SKILL.md (derive it from the skill location path shown in the prompt).
+
+### Send plain text
+
+```bash
+cd <SKILL_DIR> && uv run scripts/feishu_send.py send \
+  --chat-id <CHAT_ID> \
+  --message "你好"
+```
+
+### Reply to a message (threading)
+
+```bash
+cd <SKILL_DIR> && uv run scripts/feishu_send.py send \
+  --chat-id <CHAT_ID> \
+  --message "回复内容" \
+  --reply-to <MESSAGE_ID>
+```
+
+### Send interactive card (supports Markdown)
+
+```bash
+cd <SKILL_DIR> && uv run scripts/feishu_send.py send \
+  --chat-id <CHAT_ID> \
+  --type interactive \
+  --title "标题" \
+  --message "**加粗**, *斜体*, \`代码\`, [链接](url)"
+```
+
+### Send card with button
+
+```bash
+cd <SKILL_DIR> && uv run scripts/feishu_send.py send \
+  --chat-id <CHAT_ID> \
+  --type interactive \
+  --title "部署完成" \
+  --message "v1.2.3 已部署" \
+  --button-text "查看" \
+  --button-url "https://example.com"
+```
+
+### Send rich text (post)
+
+```bash
+cd <SKILL_DIR> && uv run scripts/feishu_send.py send \
+  --chat-id <CHAT_ID> \
+  --type post \
+  --title "报告标题" \
+  --message "第一段\n第二段"
+```
+
+### Add emoji reaction
+
+```bash
+cd <SKILL_DIR> && uv run scripts/feishu_send.py react \
+  --message-id <MESSAGE_ID> \
+  --emoji THUMBSUP
+```
+
+## Script Arguments Reference
+
+### `feishu_send.py send`
+
+| Arg | Required | Description |
+|-----|----------|-------------|
+| `--chat-id`, `-c` | Yes | Target chat ID (oc_xxx) |
+| `--message`, `-m` | Yes | Message text. Markdown only works with `--type interactive` |
+| `--type`, `-t` | No | `text` (default), `interactive`, or `post` |
+| `--title` | No | Title for card or post |
+| `--reply-to`, `-r` | No | Message ID to reply to (om_xxx) |
+| `--button-text` | No | Button label (interactive only) |
+| `--button-url` | No | Button URL (interactive only) |
+
+### `feishu_send.py react`
+
+| Arg | Required | Description |
+|-----|----------|-------------|
+| `--message-id` | Yes | Message to react to (om_xxx) |
+| `--emoji` | Yes | Emoji type: THUMBSUP, OK, HEART, SMILE, EYES, FIRE, JIAYI, CLAP, MUSCLE |
 
 ## Inbound Message Format
 
-When receiving a Feishu message, the prompt contains JSON metadata:
+When you receive a Feishu message, the prompt contains JSON metadata:
 
 ```json
 {
@@ -32,150 +117,76 @@ When receiving a Feishu message, the prompt contains JSON metadata:
 }
 ```
 
-- `chat_type`: `"p2p"` for private chat, `"group"` for group chat.
-- `type`: message type — `text`, `post`, `image`, `file`, `audio`, `video`, `sticker`.
-- `sender_id`: sender's open_id.
-- `chat_id`: use this to send replies.
-- `message_id`: use this for reply-to threading and reactions.
+Extract `chat_id` and `message_id` from this to send replies and reactions.
 
 ## Response Strategy
 
-### Quick Questions (simple Q&A, greetings, short answers)
+### Quick Questions (Q&A, greetings, lookups)
 
-Send ONE reply — just a text message. Keep it fast.
+Just send ONE text reply. No reaction, no card. Be fast.
 
-### Medium Tasks (code review, explanation, search results)
+### Medium Tasks (code review, explanation, search)
 
-1. React to the user's message with `THUMBSUP` immediately (shows you're on it)
+1. React with `THUMBSUP` to the user's `message_id`
 2. Do the work
-3. Send ONE structured reply — use **interactive card** for formatted output
+3. Send ONE card (`--type interactive`) with the result
 
-### Complex / Long-Running Tasks (multi-step coding, refactoring, research)
+### Complex / Long-Running Tasks (coding, refactoring, research, multi-step)
 
-1. React to the user's message with `EYES` immediately
-2. Spawn a background sub-agent: `agent prompt="..." run_in_background=true`
-3. Send a short text reply: "正在处理，完成后通知你"
-4. When the sub-agent finishes, send a **card** with results
+**IMPORTANT: Always use `run_in_background=true` for agent tool calls in channel conversations.**
 
-### CRITICAL RULES
+The Feishu channel is real-time — the user is waiting. You MUST stay responsive:
 
-- **ONE message per response turn.** Never send separate ack + completion text messages.
-- Use **reactions** (not text) for quick acknowledgments.
-- Use **cards** (interactive) when output has formatting, code, or structure.
-- Use **plain text** only for short, simple replies.
-- For group chats, ALWAYS use `--reply-to` to maintain thread context.
-
-## Message Type Guide
-
-| Type | When to Use | Markdown? |
-|------|-------------|-----------|
-| `text` | Short replies, plain answers | No |
-| `interactive` | Formatted output, code, results, reports | Yes (lark_md) |
-| `post` | Multi-section content with title | No |
-| `react` | Acknowledgment, quick feedback | N/A |
-
-### Markdown in Cards (interactive type)
-
-Cards support **lark_md** format:
-- `**bold**`, `*italic*`
-- `` `inline code` ``
-- `[link text](url)`
-- `\n` for line breaks
-
-Note: lark_md does NOT support multi-line code blocks (``` fences). For code, use `inline code` or send as plain text.
-
-## Command Templates
-
-Paths are relative to this skill directory.
-
-```bash
-# --- Text Messages ---
-
-# Send plain text
-uv run ./scripts/feishu_send.py send \
-  --chat-id <CHAT_ID> \
-  --message "<TEXT>"
-
-# Reply to a specific message
-uv run ./scripts/feishu_send.py send \
-  --chat-id <CHAT_ID> \
-  --message "<TEXT>" \
-  --reply-to <MESSAGE_ID>
-
-# --- Interactive Cards ---
-
-# Send card with Markdown body
-uv run ./scripts/feishu_send.py send \
-  --chat-id <CHAT_ID> \
-  --type interactive \
-  --title "Card Title" \
-  --message "**Bold**, *italic*, \`code\`"
-
-# Card with action button
-uv run ./scripts/feishu_send.py send \
-  --chat-id <CHAT_ID> \
-  --type interactive \
-  --title "Deploy Complete" \
-  --message "Version 1.2.3 deployed." \
-  --button-text "View" \
-  --button-url "https://example.com"
-
-# --- Rich Text (Post) ---
-
-uv run ./scripts/feishu_send.py send \
-  --chat-id <CHAT_ID> \
-  --type post \
-  --title "Report" \
-  --message "Paragraph one\nParagraph two"
-
-# --- Reactions ---
-
-# React to acknowledge
-uv run ./scripts/feishu_send.py react \
-  --message-id <MESSAGE_ID> \
-  --emoji THUMBSUP
-```
-
-## Common Emoji Types
-
-| Emoji | Meaning | Use When |
-|-------|---------|----------|
-| `THUMBSUP` | 👍 Got it | Acknowledging a simple request |
-| `EYES` | 👀 Looking | Starting a complex task |
-| `OK` | 👌 Done | Task completed successfully |
-| `HEART` | ❤️ Thanks | Appreciating feedback |
-| `FIRE` | 🔥 Great | Positive reaction |
-| `JIAYI` | ➕ +1 | Agreement |
-
-## Background Sub-Agent Pattern
-
-For tasks that take more than a few seconds, use the `agent` tool to spawn a background worker:
+1. React with `EYES` to the user's `message_id`
+2. Send a short text: "正在处理，完成后通知你"
+3. Spawn background agent with ALL context it needs:
 
 ```
-agent prompt="<detailed task description>. When done, use the feishu skill to send results as a card to chat_id=<CHAT_ID>" run_in_background=true
+agent prompt="<FULL task description with all file paths and context>.
+
+When finished, send the result to Feishu:
+cd <SKILL_DIR> && uv run scripts/feishu_send.py send --chat-id <CHAT_ID> --type interactive --title '任务完成' --message '<result summary>'
+
+If failed, send error:
+cd <SKILL_DIR> && uv run scripts/feishu_send.py send --chat-id <CHAT_ID> --message '任务失败: <error>'" run_in_background=true
 ```
 
-The sub-agent inherits all tools including this feishu skill, so it can send results directly when finished. This keeps the main conversation responsive.
+4. End your turn immediately — do NOT wait for the background agent
 
-## Script Interface Reference
+### When to use `run_in_background=true`
 
-### `feishu_send.py send`
+In Feishu channel conversations, **default to background** for any agent call:
+- Any task requiring more than 2-3 tool calls → background
+- File modifications, code generation → background
+- Research, multi-file analysis → background
+- Only use foreground agent for trivial, instant lookups (< 5 seconds)
 
-- `--chat-id`, `-c`: required, target chat ID
-- `--message`, `-m`: required, message text (Markdown for interactive type)
-- `--reply-to`, `-r`: optional, message_id to reply to
-- `--type`, `-t`: optional, `text` (default), `post`, or `interactive`
-- `--title`: optional, title for card or post messages
-- `--button-text`: optional, button label (interactive only)
-- `--button-url`: optional, button URL (interactive only)
+The background agent has full tool access and can send results to Feishu when done.
 
-### `feishu_send.py react`
+## CRITICAL RULES
 
-- `--message-id`: required, message to react to
-- `--emoji`: required, emoji type (e.g. THUMBSUP, HEART, EYES)
+1. **ONE message per response turn.** Never send ack text + completion text separately.
+2. **Reactions for ack, cards for results.** Don't waste a message on "收到".
+3. **Cards for anything with formatting.** Code, tables, structured data → `--type interactive`.
+4. **Plain text for short replies only.** Under ~50 chars, no formatting needed.
+5. **Group chats: ALWAYS `--reply-to`** to maintain thread context.
+6. **Background agents in channel.** Don't block the conversation with long-running foreground agents.
+7. **Self-contained background prompts.** Include chat_id, skill_dir path, and full task context in the agent prompt — the sub-agent has NO access to your conversation.
 
-## Failure Handling
+## Message Type Quick Reference
 
-- On API errors, inspect the response code and message.
-- Common errors: 230001 (bot not in chat), 230002 (no permission).
-- If reply target is invalid, fall back to a normal send.
+| Type | Use For | Markdown? |
+|------|---------|-----------|
+| `text` | Short plain replies | No |
+| `interactive` | Formatted results, code, reports | Yes (lark_md: **bold**, *italic*, \`code\`, [link](url)) |
+| `post` | Multi-paragraph with title | No |
+| `react` | Quick ack/feedback | N/A |
+
+Note: lark_md does NOT support ``` code fences. Use \`inline code\` or send code as plain text.
+
+## Error Handling
+
+- API errors: check response code and message
+- 230001: bot not in chat — ask user to add bot
+- 230002: no permission — check app permissions
+- Reply target invalid: script auto-falls back to normal send
