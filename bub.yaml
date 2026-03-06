@@ -1,0 +1,75 @@
+# Bub configuration file
+# Values here are overridden by environment variables (BUB_ prefix) and .env file.
+
+# ---------------------------------------------------------------------------
+# Model / Provider
+# ---------------------------------------------------------------------------
+model: "openrouter:minimax/minimax-m2.5"
+# api_key: "sk-..."
+# api_base: "https://openrouter.ai/api/v1"
+
+# ---------------------------------------------------------------------------
+# Runtime behavior
+# ---------------------------------------------------------------------------
+max_tokens: 16384
+max_steps: 100
+model_timeout_seconds: 300
+# system_prompt: "You are a coding agent."
+# home: "~/.bub"
+# workspace_path: null
+tape_name: "bub"
+
+# ---------------------------------------------------------------------------
+# Proactive response
+# ---------------------------------------------------------------------------
+proactive_response: false
+message_delay_seconds: 10
+message_debounce_seconds: 1
+active_time_window_seconds: 60
+
+# ---------------------------------------------------------------------------
+# Telegram channel
+# ---------------------------------------------------------------------------
+telegram_enabled: false
+# telegram_token: "123456:telegram-bot-token"
+# telegram_allow_from:
+#   - "123456789"
+#   - "my_username"
+# telegram_allow_chats:
+#   - "123456789"
+#   - "-1001234567890"
+# telegram_proxy: "http://127.0.0.1:1080"
+
+# ---------------------------------------------------------------------------
+# Discord channel
+# ---------------------------------------------------------------------------
+discord_enabled: false
+# discord_token: "discord_bot_token"
+# discord_allow_from:
+#   - "123456789012345678"
+#   - "my_discord_name"
+# discord_allow_channels:
+#   - "123456789012345678"
+discord_command_prefix: "!"
+# discord_proxy: "http://127.0.0.1:7890"
+
+# ---------------------------------------------------------------------------
+# Web Search (priority: exa > brave > ollama > duckduckgo fallback)
+# ---------------------------------------------------------------------------
+# exa_api_key: "exa-..."
+# brave_api_key: "BSA..."
+
+# ---------------------------------------------------------------------------
+# Observability / Tracing
+# ---------------------------------------------------------------------------
+trace_enabled: true
+trace_backend: "langfuse"  # langfuse | otel
+
+# Langfuse
+langfuse_public_key: "pk-lf-abf2d10d-71f0-4d4c-8be6-98a7b45578ad"
+langfuse_secret_key: "sk-lf-f152ea56-ebee-4c17-ab5a-ebd0364fc2c2"
+langfuse_host: "https://cloud.langfuse.com"
+
+# OpenTelemetry
+otel_service_name: "bub"
+# otel_endpoint: "http://localhost:4317"

@@ -1,3 +1,10 @@
+
+
+
+
+
+
+
 """Built-in tool definitions."""
 
 from __future__ import annotations
@@ -255,6 +262,122 @@ def _grep_python(params: GrepInput, search_path: Path) -> str:
     return "\n".join(results)
 
 
+async def _web_search_exa(api_key: str, params: SearchInput) -> str:
+    """Search via Exa API (https://exa.ai)."""
+    import aiohttp
+
+    payload = {
+        "query": params.query,
+        "numResults": params.max_results,
+        "type": "auto",
+        "contents": {"text": {"maxCharacters": 300}},
+    }
+    try:
+        async with (
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=WEB_REQUEST_TIMEOUT_SECONDS)) as session,
+            session.post(
+                "https://api.exa.ai/search",
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "User-Agent": WEB_USER_AGENT,
+                },
+            ) as response,
+        ):
+            data = await response.json()
+    except aiohttp.ClientError as exc:
+        return f"exa error: {exc!s}"
+
+    results = data.get("results")
+    if not isinstance(results, list) or not results:
+        return "none"
+    lines: list[str] = []
+    for idx, item in enumerate(results, start=1):
+        title = str(item.get("title") or "(untitled)")
+        url = str(item.get("url") or "")
+        text = str(item.get("text") or "")
+        lines.append(f"{idx}. {title}")
+        if url:
+            lines.append(f"   {url}")
+        if text:
+            lines.append(f"   {text}")
+    return "\n".join(lines) if lines else "none"
+
+
+async def _web_search_brave(api_key: str, params: SearchInput) -> str:
+    """Search via Brave Search API (https://brave.com/search/api/)."""
+    import aiohttp
+
+    query = urllib_parse.quote_plus(params.query)
+    url = f"https://api.search.brave.com/res/v1/web/search?q={query}&count={params.max_results}"
+    try:
+        async with (
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=WEB_REQUEST_TIMEOUT_SECONDS)) as session,
+            session.get(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "gzip",
+                    "X-Subscription-Token": api_key,
+                    "User-Agent": WEB_USER_AGENT,
+                },
+            ) as response,
+        ):
+            data = await response.json()
+    except aiohttp.ClientError as exc:
+        return f"brave error: {exc!s}"
+
+    web_results = data.get("web", {}).get("results")
+    if not isinstance(web_results, list) or not web_results:
+        return "none"
+    return _format_search_results(
+        [{"title": r.get("title"), "url": r.get("url"), "content": r.get("description")} for r in web_results]
+    )
+
+
+async def _web_search_ollama(runtime: AppRuntime, params: SearchInput) -> str:
+    """Search via Ollama web search endpoint."""
+    import aiohttp
+
+    api_key = runtime.settings.ollama_api_key
+    if not api_key:
+        return "error: ollama api key is not configured"
+
+    api_base = _normalize_api_base(runtime.settings.ollama_api_base or DEFAULT_OLLAMA_WEB_API_BASE)
+    if not api_base:
+        return "error: invalid ollama api base url"
+
+    endpoint = f"{api_base}/web_search"
+    payload = {"query": params.query, "max_results": params.max_results}
+    try:
+        async with (
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=WEB_REQUEST_TIMEOUT_SECONDS)) as session,
+            session.post(
+                endpoint,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": WEB_USER_AGENT,
+                },
+            ) as response,
+        ):
+            response_body = await response.text()
+    except aiohttp.ClientError as exc:
+        return f"ollama error: {exc!s}"
+
+    try:
+        data = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        return f"error: invalid json response: {exc!s}"
+
+    results = data.get("results")
+    if not isinstance(results, list) or not results:
+        return "none"
+    return _format_search_results(results)
+
+
 def register_builtin_tools(
     registry: ToolRegistry,
     *,
@@ -324,6 +447,7 @@ def register_builtin_tools(
         name="fs.read",
         short_description="Read a file's text content with optional line range",
         model=ReadInput,
+        always_expand=True,
         guidance=ToolGuidance(
             when_to_use="Inspecting source code, config files, logs. Use offset/limit for large files.",
             when_not_to="Searching across many files (use fs.grep). Finding files by name (use fs.glob).",
@@ -351,6 +475,7 @@ def register_builtin_tools(
         name="fs.write",
         short_description="Create or overwrite a file with UTF-8 text",
         model=WriteInput,
+        always_expand=True,
         guidance=ToolGuidance(
             when_to_use="Creating new files or completely rewriting existing files.",
             when_not_to="Making targeted edits to existing files (use fs.edit instead).",
@@ -480,6 +605,7 @@ def register_builtin_tools(
         name="web.fetch",
         short_description="Fetch a URL and return content as text",
         model=FetchInput,
+        always_expand=True,
         guidance=ToolGuidance(
             when_to_use="Reading web pages, API documentation, or fetching remote resources.",
             when_not_to="Searching the web for information (use web.search first to find URLs).",
@@ -600,59 +726,34 @@ def register_builtin_tools(
 
         return "\n".join(rows)
 
-    if runtime.settings.ollama_api_key:
+    @register(
+        name="web.search",
+        short_description="Search the web using Exa, Brave, or Ollama",
+        model=SearchInput,
+        always_expand=True,
+        guidance=ToolGuidance(
+            when_to_use="Finding information, documentation, articles, or URLs on the internet.",
+            when_not_to="Reading a known URL (use web.fetch). Searching local files (use fs.grep).",
+            constraints="Backend priority: exa > brave > ollama > duckduckgo URL fallback. Configure API keys in settings.",
+        ),
+    )
+    async def web_search(params: SearchInput) -> str:
+        """Search the web and return ranked results.
 
-        @register(name="web.search", short_description="Search the web", model=SearchInput)
-        async def web_search_ollama(params: SearchInput) -> str:
-            import aiohttp
-
-            api_key = runtime.settings.ollama_api_key
-            if not api_key:
-                return "error: ollama api key is not configured"
-
-            api_base = _normalize_api_base(runtime.settings.ollama_api_base or DEFAULT_OLLAMA_WEB_API_BASE)
-            if not api_base:
-                return "error: invalid ollama api base url"
-
-            endpoint = f"{api_base}/web_search"
-            payload = {
-                "query": params.query,
-                "max_results": params.max_results,
-            }
-            try:
-                async with (
-                    aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=WEB_REQUEST_TIMEOUT_SECONDS)) as session,
-                    session.post(
-                        endpoint,
-                        json=payload,
-                        headers={
-                            "Content-Type": "application/json",
-                            "Authorization": f"Bearer {api_key}",
-                            "User-Agent": WEB_USER_AGENT,
-                        },
-                    ) as response,
-                ):
-                    response_body = await response.text()
-            except aiohttp.ClientError as exc:
-                return f"HTTP error: {exc!s}"
-
-            try:
-                data = json.loads(response_body)
-            except json.JSONDecodeError as exc:
-                return f"error: invalid json response: {exc!s}"
-
-            results = data.get("results")
-            if not isinstance(results, list) or not results:
-                return "none"
-            return _format_search_results(results)
-
-    else:
-
-        @register(name="web.search", short_description="Search the web", model=SearchInput)
-        def web_search_default(params: SearchInput) -> str:
-            """Return a DuckDuckGo search URL for the query."""
-            query = urllib_parse.quote_plus(params.query)
-            return f"https://duckduckgo.com/?q={query}"
+        Usage:
+        - Results include title, URL, and a content snippet.
+        - Configure at least one search backend API key for real results.
+        - Without any API key, falls back to returning a DuckDuckGo search URL.
+        - Backend priority: exa_api_key > brave_api_key > ollama_api_key > fallback.
+        """
+        if runtime.settings.exa_api_key:
+            return await _web_search_exa(runtime.settings.exa_api_key, params)
+        if runtime.settings.brave_api_key:
+            return await _web_search_brave(runtime.settings.brave_api_key, params)
+        if runtime.settings.ollama_api_key:
+            return await _web_search_ollama(runtime, params)
+        query = urllib_parse.quote_plus(params.query)
+        return f"(no search API key configured, try: https://duckduckgo.com/?q={query})"
 
     @register(name="help", short_description="Show command help", model=EmptyInput)
     def command_help(_params: EmptyInput) -> str:
@@ -738,7 +839,7 @@ def register_builtin_tools(
         await tape.handoff(anchor_name, state=state or None)
         return f"handoff created: {anchor_name}"
 
-    @register(name="tape.anchors", short_description="List tape anchors", model=EmptyInput)
+    @register(name="tape.anchors", short_description="List tape anchors", model=EmptyInput, always_expand=True)
     async def anchors(_params: EmptyInput) -> str:
         """List recent tape anchors."""
         rows = []
@@ -750,6 +851,7 @@ def register_builtin_tools(
         name="tape.info",
         short_description="Show tape context size and anchor status",
         model=EmptyInput,
+        always_expand=True,
         guidance=ToolGuidance(
             when_to_use="Checking how much context has been used. Deciding whether a tape.handoff is needed.",
             when_not_to="No need to check routinely — check when context feels large or before a complex phase.",
@@ -793,7 +895,7 @@ def register_builtin_tools(
         runtime.reset_session_context(context.state.get("session_id", ""))
         return result
 
-    @register(name="skills.list", short_description="List skills", model=EmptyInput)
+    @register(name="skills.list", short_description="List skills", model=EmptyInput, always_expand=True)
     def list_skills(_params: EmptyInput) -> str:
         """List all discovered skills in compact form."""
         skills = runtime.discover_skills()

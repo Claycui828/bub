@@ -43,11 +43,13 @@ class Settings(BaseSettings):
         env_parse_none_str="null",
     )
 
-    model: str = "openrouter:qwen/qwen3-coder-next"
+    model: str = "openrouter:minimax/minimax-m2.5"
     api_key: str | None = None
     api_base: str | None = None
     ollama_api_key: str | None = None
     ollama_api_base: str | None = None
+    exa_api_key: str | None = None
+    brave_api_key: str | None = None
     llm_api_key: str | None = Field(default=None, validation_alias="LLM_API_KEY")
     openrouter_api_key: str | None = Field(default=None, validation_alias="OPENROUTER_API_KEY")
     max_tokens: int = Field(default=1024, ge=1)

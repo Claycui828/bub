@@ -103,7 +103,8 @@ def test_web_search_default_returns_duckduckgo_url(tmp_path: Path, scheduler: Ba
     settings = Settings(_env_file=None, model="openrouter:test")
     registry = _build_registry(tmp_path, settings, scheduler)
     result = _execute_tool(registry, "web.search", kwargs={"query": "psiace bub"})
-    assert result == "https://duckduckgo.com/?q=psiace+bub"
+    assert "duckduckgo.com" in result
+    assert "psiace+bub" in result
 
 
 def test_web_fetch_default_normalizes_url_and_extracts_text(
