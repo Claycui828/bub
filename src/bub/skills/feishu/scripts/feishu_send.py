@@ -1,3 +1,7 @@
+
+
+
+
 #!/usr/bin/env uv run
 # /// script
 # requires-python = ">=3.10"
@@ -92,6 +96,55 @@ def add_reaction(token: str, message_id: str, emoji_type: str) -> dict:
     return result
 
 
+def send_image(token: str, chat_id: str, image_url: str, reply_to: str | None = None) -> dict:
+    """Send an image to a Feishu chat by URL."""
+    # First, download the image from URL
+    try:
+        img_resp = requests.get(image_url, timeout=30)
+        img_resp.raise_for_status()
+        image_content = img_resp.content
+    except Exception as e:
+        print(f"Failed to download image: {e}")
+        sys.exit(1)
+
+    # Upload to Feishu
+    upload_url = f"{BASE_URL}/im/v1/images"
+    files = {"image": ("image.png", image_content, "image/png")}
+    data = {"image_type": "message"}
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = requests.post(upload_url, files=files, data=data, headers=headers, timeout=30)
+    resp.raise_for_status()
+    result = resp.json()
+    if result.get("code") != 0:
+        print(f"Upload error: code={result.get('code')} msg={result.get('msg')}")
+        sys.exit(1)
+
+    image_key = result.get("data", {}).get("image_key")
+
+    # Send the image message
+    msg_url = f"{BASE_URL}/im/v1/messages"
+    params = {"receive_id_type": "chat_id"}
+    payload = {
+        "receive_id": chat_id,
+        "msg_type": "image",
+        "content": json.dumps({"image_key": image_key}),
+    }
+
+    if reply_to:
+        msg_url = f"{BASE_URL}/im/v1/messages/{reply_to}/reply"
+        payload = {"msg_type": "image", "content": json.dumps({"image_key": image_key})}
+        params = {}
+
+    resp = requests.post(msg_url, params=params, json=payload, headers=make_headers(token), timeout=30)
+    resp.raise_for_status()
+    result = resp.json()
+    if result.get("code") != 0:
+        print(f"API error: code={result.get('code')} msg={result.get('msg')}")
+        sys.exit(1)
+    return result
+
+
 def build_text_content(text: str) -> str:
     return json.dumps({"text": text})
 
@@ -152,8 +205,14 @@ def main():
     p_react.add_argument("--message-id", required=True, help="Message ID to react to (om_xxx)")
     p_react.add_argument("--emoji", required=True, help="Emoji type, e.g. THUMBSUP, HEART, SMILE, OK, JIAYI")
 
+    # --- image ---
+    p_image = sub.add_parser("image", help="Send an image to a chat")
+    p_image.add_argument("--chat-id", "-c", required=True, help="Target chat ID (oc_xxx)")
+    p_image.add_argument("--url", "-u", required=True, help="Image URL to send")
+    p_image.add_argument("--reply-to", "-r", help="Message ID to reply to (om_xxx)")
+
     # --- common ---
-    for p in [p_send, p_react]:
+    for p in [p_send, p_react, p_image]:
         p.add_argument("--app-id", help="Feishu App ID (defaults to BUB_FEISHU_APP_ID)")
         p.add_argument("--app-secret", help="Feishu App Secret (defaults to BUB_FEISHU_APP_SECRET)")
 
@@ -188,6 +247,11 @@ def main():
             send_message(token, args.chat_id, msg_type, content, getattr(args, "reply_to", None))
             mode = "replied" if getattr(args, "reply_to", None) else "sent"
             print(f"{msg_type} message {mode} successfully to {args.chat_id}")
+
+        elif args.command == "image":
+            send_image(token, args.chat_id, args.url, getattr(args, "reply_to", None))
+            mode = "replied" if getattr(args, "reply_to", None) else "sent"
+            print(f"image {mode} successfully to {args.chat_id}")
 
     except requests.HTTPError as e:
         print(f"HTTP Error: {e}")

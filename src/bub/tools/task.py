@@ -1,3 +1,4 @@
+
 """Task management tools."""
 
 from __future__ import annotations
@@ -58,7 +59,10 @@ def _load_tasks(workspace: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+        return []
     except (json.JSONDecodeError, OSError):
         return []
 

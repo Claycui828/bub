@@ -5,6 +5,8 @@
 
 
 
+
+
 """Built-in tool definitions."""
 
 from __future__ import annotations
@@ -99,12 +101,19 @@ class SearchInput(BaseModel):
     max_results: int = Field(default=5, ge=1, le=10, description="Number of search results to return.")
 
 
+class ImageGenInput(BaseModel):
+    prompt: str = Field(..., description="Image generation prompt. Be detailed and descriptive.")
+    size: str | None = Field(default=None, description="Image size: 1024x1024, 1792x1024, or 1024x1792.")
+    quality: str | None = Field(default=None, description="Quality: standard or hd.")
+
+
 class HandoffInput(BaseModel):
     name: str | None = Field(default=None, description="Anchor name for this checkpoint. Defaults to 'handoff'. Use descriptive names like 'phase-1-bootstrap'.")
     summary: str | None = Field(default=None, description="Self-contained summary of what was accomplished. A reader with no prior context must understand this.")
     next_steps: str | None = Field(default=None, description="Clear, actionable next steps for the continued work after this checkpoint.")
     files_modified: list[str] | None = Field(default=None, description="List of file paths that were created or modified in this phase.")
     decisions: list[str] | None = Field(default=None, description="Key architectural or design decisions made, with brief rationale.")
+    expanded_tools: list[str] | None = Field(default=None, description="Tool names the next phase should keep expanded. Tools not in this list (except always-expanded ones) will be collapsed back to compact view. Omit to collapse all non-always-expanded tools.")
 
 
 class ToolNameInput(BaseModel):
@@ -758,6 +767,78 @@ def register_builtin_tools(
         query = urllib_parse.quote_plus(params.query)
         return f"(no search API key configured, try: https://duckduckgo.com/?q={query})"
 
+    async def _image_generate_openrouter(runtime: AppRuntime, params: ImageGenInput) -> str:
+        """Generate image via OpenRouter API."""
+        import aiohttp
+
+        api_key = runtime.settings.resolved_api_key
+        if not api_key:
+            return "Error: No API key configured. Set LLM_API_KEY or OPENROUTER_API_KEY."
+
+        model = runtime.settings.image_model
+        payload = {
+            "model": model,
+            "prompt": params.prompt,
+        }
+        if params.size:
+            payload["size"] = params.size
+        if params.quality:
+            payload["quality"] = params.quality
+
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session,
+                session.post(
+                    "https://openrouter.ai/api/v1/images/generations",
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://bub.build/",
+                        "X-Title": "Bub",
+                    },
+                ) as response,
+            ):
+                data = await response.json()
+        except aiohttp.ClientError as exc:
+            return f"image generation error: {exc!s}"
+
+        if response.status != 200:
+            return f"API error: {data}"
+
+        images = data.get("data", [])
+        if not images:
+            return "No image generated"
+
+        # Return the first image URL
+        image_url = images[0].get("url") or images[0].get("b64_json")
+        if image_url:
+            return f"Image generated: {image_url}"
+        return "Image generated but no URL returned"
+
+    @register(
+        name="image.generate",
+        short_description="Generate an image using AI via OpenRouter",
+        model=ImageGenInput,
+        guidance=ToolGuidance(
+            when_to_use="Creating images, artwork, or visual content from text descriptions.",
+            when_not_to="Editing existing images (not supported).",
+            constraints="Uses OpenRouter API with FLUX.1-schnell model by default. Requires API key.",
+        ),
+    )
+    async def image_generate(params: ImageGenInput, context: ToolContext) -> str:
+        """Generate an image from a text prompt.
+
+        Usage:
+        - Provide a detailed prompt describing the image you want.
+        - Optional: specify size (1024x1024, 1792x1024, 1024x1792) and quality (standard, hd).
+        - Returns an image URL that can be viewed or shared.
+        """
+        runtime = context.state.get("runtime")
+        if not runtime:
+            return "Error: runtime not available"
+        return await _image_generate_openrouter(runtime, params)
+
     @register(name="help", short_description="Show command help", model=EmptyInput)
     def command_help(_params: EmptyInput) -> str:
         """Show Bub internal command usage and examples."""
@@ -809,9 +890,12 @@ def register_builtin_tools(
             ),
             constraints=(
                 "After handoff, ALL messages before the anchor are dropped from context. "
-                "Only the handoff state (summary, next_steps, files_modified, decisions) survives as a system message. "
+                "Only the handoff state (summary, next_steps, files_modified, decisions, expanded_tools) survives. "
                 "Write SELF-CONTAINED summaries: a reader with no prior context must understand what was done. "
-                "Always include file paths for modified files. After handoff, re-read files before modifying them."
+                "Always include file paths for modified files. After handoff, re-read files before modifying them. "
+                "Use expanded_tools to pass tool names the next phase will need — "
+                "tools not listed (except always-expanded ones marked [always-expanded] in <tool_view>) "
+                "will collapse back to compact view. Omit expanded_tools to collapse all."
             ),
         ),
     )
@@ -839,6 +923,8 @@ def register_builtin_tools(
             state["files_modified"] = params.files_modified
         if params.decisions:
             state["decisions"] = params.decisions
+        if params.expanded_tools is not None:
+            state["expanded_tools"] = params.expanded_tools
         await tape.handoff(anchor_name, state=state or None)
         return f"handoff created: {anchor_name}"
 

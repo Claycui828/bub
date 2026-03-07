@@ -1,3 +1,10 @@
+
+
+
+
+
+
+
 """Agent delegation tool with predefined agent types."""
 
 from __future__ import annotations
@@ -6,8 +13,9 @@ import asyncio
 import json
 import textwrap
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -326,7 +334,12 @@ def register_agent_tools(
 
         # Emit live events to parent session for CLI visibility.
         parent_session = runtime._sessions.get(parent_session_id)
-        emit = parent_session.model_runner._emit_live if parent_session else lambda *a, **k: None
+        def _default_emit(_event: str, _data: dict[str, Any]) -> None:
+            pass
+
+        emit: Callable[[str, dict[str, Any]], None] = (
+            parent_session.model_runner._emit_live if parent_session else _default_emit
+        )
 
         # Resolve agent_type + explicit overrides into final config.
         model, system_prompt, tool_set = _resolve_agent_config(params)
@@ -376,9 +389,11 @@ def register_agent_tools(
         sub_session = runtime.get_session(
             sub_session_id, model=model, system_prompt=system_prompt, allowed_tools=tool_set,
         )
-        sub_session.model_runner.set_live_callback(
-            lambda event, data, _aid=agent_id: emit(f"sub_agent.{event}", {**data, "agent_id": _aid})
-        )
+
+        def _live_callback(event: str, data: dict[str, Any]) -> None:
+            emit(f"sub_agent.{event}", {**data, "agent_id": agent_id})
+
+        sub_session.model_runner.set_live_callback(_live_callback)
 
         result = await runtime.handle_input(
             sub_session_id,
@@ -497,7 +512,8 @@ def _get_session_tape_name(runtime: AppRuntime, session_id: str) -> str | None:
     session = runtime._sessions.get(session_id)
     if session is None:
         return None
-    return session.tape._tape.name
+    tape_name = session.tape._tape.name
+    return tape_name if isinstance(tape_name, str) else None
 
 
 async def _run_background(
@@ -509,7 +525,7 @@ async def _run_background(
     system_prompt: str | None,
     allowed_tools: set[str] | None,
     *,
-    emit: object = None,
+    emit: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> None:
     """Execute a sub-agent in the background and update its record on completion."""
     # Wire live callback so background sub-agent events are visible in CLI.
@@ -517,9 +533,11 @@ async def _run_background(
         sub_session = runtime.get_session(
             record.session_id, model=model, system_prompt=system_prompt, allowed_tools=allowed_tools,
         )
-        sub_session.model_runner.set_live_callback(
-            lambda event, data, _aid=record.agent_id: emit(f"sub_agent.{event}", {**data, "agent_id": _aid})
-        )
+
+        def _bg_live_callback(event: str, data: dict[str, Any]) -> None:
+            emit(f"sub_agent.{event}", {**data, "agent_id": record.agent_id})
+
+        sub_session.model_runner.set_live_callback(_bg_live_callback)
         emit("sub_agent.start", {
             "agent_id": record.agent_id,
             "agent_type": record.agent_type,

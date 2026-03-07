@@ -60,7 +60,7 @@ class TestHandoffContextInjection:
     """Verify that handoff anchor state is injected as a system message via context.state."""
 
     def test_handoff_state_injected_as_first_message(self) -> None:
-        """When HANDOFF_STATE_KEY is set in context.state, a system message is prepended."""
+        """When HANDOFF_STATE_KEY is set in context.state, a user message is prepended."""
         context = default_tape_context({
             HANDOFF_STATE_KEY: {"summary": "did some work", "next_steps": "do more"},
         })
@@ -69,7 +69,7 @@ class TestHandoffContextInjection:
             TapeEntry.message({"role": "user", "content": "continue"}),
         ]
         messages = context.select(entries, context)
-        assert messages[0]["role"] == "system"
+        assert messages[0]["role"] == "user"
         assert "did some work" in messages[0]["content"]
         assert "do more" in messages[0]["content"]
         assert messages[1] == {"role": "user", "content": "continue"}
@@ -111,7 +111,7 @@ class TestHandoffContextInjection:
             TapeEntry.message({"role": "user", "content": "next"}),
         ]
         messages = context.select(entries, context)
-        assert messages[0]["role"] == "system"
+        assert messages[0]["role"] == "user"
         assert "code review done" in messages[0]["content"]
         assert "findings" in messages[0]["content"]
 
@@ -122,7 +122,7 @@ class TestHandoffContextInjection:
         })
         messages = context.select([], context)
         assert len(messages) == 1
-        assert messages[0]["role"] == "system"
+        assert messages[0]["role"] == "user"
         assert "phase complete" in messages[0]["content"]
 
 

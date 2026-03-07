@@ -31,7 +31,7 @@ def _select_messages(entries: Iterable[TapeEntry], context: TapeContext) -> list
     if isinstance(anchor_state, dict) and anchor_state:
         rendered = _render_handoff_context(anchor_state)
         if rendered:
-            messages.append({"role": "system", "content": rendered})
+            messages.append({"role": "user", "content": rendered})
 
     pending_calls: list[dict[str, Any]] = []
 
@@ -51,7 +51,7 @@ def _select_messages(entries: Iterable[TapeEntry], context: TapeContext) -> list
     return messages
 
 
-_HANDOFF_KNOWN_KEYS = {"summary", "next_steps", "owner", "files_modified", "decisions"}
+_HANDOFF_KNOWN_KEYS = {"summary", "next_steps", "owner", "files_modified", "decisions", "expanded_tools"}
 
 
 def _render_handoff_context(state: dict[str, Any]) -> str | None:

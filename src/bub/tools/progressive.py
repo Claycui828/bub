@@ -25,27 +25,29 @@ class ProgressiveToolView:
         """Clear expanded tool details for a fresh prompt context."""
         self.expanded.clear()
 
+    def reset_to(self, names: list[str]) -> None:
+        """Reset expanded set to only the given tool names (validated against registry)."""
+        self.expanded = {n for n in names if self.registry.has(n)}
+
     def _effective_expanded(self) -> set[str]:
         """Return expanded set union with always-expanded tools."""
         always = {d.name for d in self.registry.descriptors() if d.always_expand}
         return self.expanded | always
 
-    def note_hint(self, hint: str) -> bool:
-        """Expand one tool when hint matches tool name (case-insensitive)."""
-
-        normalized = hint.casefold()
-        for descriptor in self.registry.descriptors():
-            model_name = self.registry.to_model_name(descriptor.name)
-            if descriptor.name.casefold() != normalized and model_name.casefold() != normalized:
-                continue
-            self.expanded.add(descriptor.name)
-            return True
-        return False
+    def always_expanded_names(self) -> list[str]:
+        """Return names of tools that are always expanded."""
+        return [d.name for d in self.registry.descriptors() if d.always_expand]
 
     def compact_block(self) -> str:
+        always = {d.name for d in self.registry.descriptors() if d.always_expand}
         lines = ["<tool_view>"]
-        for row in self.registry.compact_rows(for_model=True):
-            lines.append(f"  - {row}")
+        for descriptor in self.registry.descriptors():
+            display_name = self.registry.to_model_name(descriptor.name)
+            suffix = " [always-expanded]" if descriptor.name in always else ""
+            if display_name != descriptor.name:
+                lines.append(f"  - {display_name} (command: {descriptor.name}): {descriptor.short_description}{suffix}")
+            else:
+                lines.append(f"  - {display_name}: {descriptor.short_description}{suffix}")
         lines.append("</tool_view>")
         return "\n".join(lines)
 

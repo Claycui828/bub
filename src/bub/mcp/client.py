@@ -1,3 +1,10 @@
+
+
+
+
+
+
+
 """MCP client — connects to configured MCP servers and bridges their tools into ToolRegistry."""
 
 from __future__ import annotations
@@ -108,7 +115,10 @@ class McpClientManager:
 
     async def _connect_http(self, cfg: McpServerConfig) -> list[McpToolInfo]:
         """Discover tools from an HTTP MCP server (stateless, reconnects per call)."""
-        tools = await self._http_session_call(cfg.url, self._list_tools_callback)
+        url = cfg.url
+        if not url:
+            return []
+        tools = await self._http_session_call(url or "", self._list_tools_callback)
         self._http_configs[cfg.name] = cfg
         result: list[McpToolInfo] = []
         for tool in tools:
@@ -165,17 +175,20 @@ class McpClientManager:
 
         # HTTP: reconnect per call
         cfg = self._http_configs.get(server_name)
-        if cfg is not None:
+        if cfg is not None and cfg.url:
             return await self._call_http_tool(cfg.url, tool_name, arguments)
 
         return f"error: MCP server '{server_name}' not connected"
 
     async def _call_http_tool(self, url: str, tool_name: str, arguments: dict[str, Any]) -> str:
         """Call a tool via a short-lived HTTP session."""
+        if not url:
+            return "error: MCP server URL is empty"
         try:
             async def _callback(session: ClientSession) -> str:
                 return await self._execute_tool(session, tool_name, arguments)
-            return await self._http_session_call(url, _callback)
+            result: Any = await self._http_session_call(url, _callback)
+            return str(result) if result else "empty response"
         except Exception as exc:
             return f"mcp error: {exc!s}"
 

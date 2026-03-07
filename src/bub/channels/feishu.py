@@ -1,3 +1,5 @@
+
+
 """Feishu (Lark) channel adapter using WebSocket long connection."""
 
 from __future__ import annotations
@@ -208,7 +210,7 @@ class FeishuChannel(BaseChannel["_FeishuEvent"]):
             # Fire-and-forget into asyncio loop — do NOT block the SDK thread,
             # otherwise the SDK thinks delivery failed and redelivers the event.
             if self._on_receive and self._loop:
-                asyncio.run_coroutine_threadsafe(self._on_receive(feishu_event), self._loop)
+                asyncio.run_coroutine_threadsafe(self._on_receive(feishu_event), self._loop)  # type: ignore[arg-type]
         except Exception:
             logger.opt(exception=True).error("feishu.on_message.error")
 
@@ -311,12 +313,12 @@ def _parse_mentions(raw_mentions: Any) -> list[dict[str, str]]:
 def _parse_content(msg_type: str, content_json: str) -> str:
     """Parse Feishu message content JSON to plain text."""
     try:
-        data = json.loads(content_json)
+        data: dict[str, Any] = json.loads(content_json)
     except (json.JSONDecodeError, TypeError):
         return content_json
 
     if msg_type == "text":
-        return data.get("text", "")
+        return str(data.get("text", ""))
 
     if msg_type == "post":
         return _flatten_post(data)

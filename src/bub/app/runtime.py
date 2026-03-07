@@ -1,3 +1,5 @@
+
+
 """Application runtime and session management."""
 
 from __future__ import annotations
@@ -59,6 +61,12 @@ class SessionRuntime:
             anchor_state = self.tape.last_anchor_state()
             if anchor_state:
                 ctx_state[HANDOFF_STATE_KEY] = anchor_state
+                # Apply tool view narrowing from handoff state.
+                expanded_tools = anchor_state.get("expanded_tools")
+                if isinstance(expanded_tools, list):
+                    self.tool_view.reset_to(expanded_tools)
+                else:
+                    self.tool_view.reset()
             tape.context = default_tape_context(ctx_state)
             return await self.loop.handle_input(text)
 
@@ -249,15 +257,16 @@ class AppRuntime:
             self._active_inputs.add(task)
             try:
                 result = await task
+            except Exception as exc:
+                trace_span.end(output=f"exception: {exc!s}", level="ERROR")
+                raise
+            else:
                 trace_span.end(
                     output=result.assistant_output[:4096] if result.assistant_output else None,
                     metadata={"steps": result.steps, "error": result.error},
                     level="ERROR" if result.error else "DEFAULT",
                 )
                 return result
-            except Exception as exc:
-                trace_span.end(output=f"exception: {exc!s}", level="ERROR")
-                raise
             finally:
                 self._active_inputs.discard(task)
                 tracer.flush()

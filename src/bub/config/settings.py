@@ -1,3 +1,4 @@
+
 """Application settings."""
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ class Settings(BaseSettings):
     brave_api_key: str | None = None
     llm_api_key: str | None = Field(default=None, validation_alias="LLM_API_KEY")
     openrouter_api_key: str | None = Field(default=None, validation_alias="OPENROUTER_API_KEY")
+    image_model: str = "blackforestlabs/FLUX.1-schnell"
     max_tokens: int = Field(default=1024, ge=1)
     model_timeout_seconds: int | None = 90
     system_prompt: str = ""

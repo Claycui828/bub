@@ -1,3 +1,5 @@
+
+
 """Build tracer from settings."""
 
 from __future__ import annotations
@@ -6,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from bub.observability.tracer import NullTracer, Tracer
+from bub.observability.tracer import NullTracer, Tracer, TracerBackend
 
 if TYPE_CHECKING:
     from bub.config.settings import Settings
@@ -22,7 +24,7 @@ def build_tracer(settings: Settings) -> Tracer:
     if backend_name == "langfuse":
         from bub.observability.langfuse_tracer import LangfuseBackend
 
-        backend = LangfuseBackend(
+        backend: TracerBackend = LangfuseBackend(
             public_key=settings.langfuse_public_key,
             secret_key=settings.langfuse_secret_key,
             host=settings.langfuse_host,

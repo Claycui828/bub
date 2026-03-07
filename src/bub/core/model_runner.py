@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -21,7 +20,6 @@ from bub.tape.service import TapeService
 from bub.tools.progressive import ProgressiveToolView
 from bub.tools.view import render_tool_compact_block, render_tool_expanded_block
 
-HINT_RE = re.compile(r"\$([A-Za-z0-9_.-]+)")
 TOOL_CONTINUE_PROMPT = "Continue the task."
 
 # Type for live output callback: (event_type, data)
@@ -132,7 +130,6 @@ class ModelRunner:
         tracer = current_tracer()
         state = _PromptState(prompt=prompt)
         self._stop_requested = False
-        self._activate_hints(prompt)
 
         while state.step < self._max_steps and not state.exit_requested and not self._stop_requested:
             # Wait if paused (non-blocking when running).
@@ -196,7 +193,6 @@ class ModelRunner:
                 await self._tape.append_event("loop.step.empty", {"step": state.step})
                 break
 
-            self._activate_hints(assistant_text)
             route = await self._router.route_assistant(assistant_text)
             await self._consume_route(state, route)
             if not route.next_prompt:
@@ -331,17 +327,6 @@ class ModelRunner:
                 break
         return messages
 
-    def _activate_hints(self, text: str) -> None:
-        skill_index = self._build_skill_index()
-        for match in HINT_RE.finditer(text):
-            hint = match.group(1)
-            self._tool_view.note_hint(hint)
-
-            skill = skill_index.get(hint.casefold())
-            if skill is None:
-                continue
-            self._expanded_skills.add(skill.name)
-
     def _build_skill_index(self) -> dict[str, SkillMetadata]:
         return {skill.name.casefold(): skill for skill in self._list_skills()}
 
@@ -380,11 +365,9 @@ def _runtime_contract() -> str:
         The <tool_view> above lists all available tools with short descriptions.
         Some tools show full schema in <tool_details> (always-expanded core tools).
         For OTHER tools (especially MCP tools prefixed with mcp__), you must discover their arguments BEFORE calling them:
-        - Write '$tool_name' in your response to expand its full schema, guidance, and examples.
-        - Example: writing '$mcp__feishu__search_doc' will reveal its parameters in the next turn.
-        - You can also call tool.describe with the tool name for immediate details.
+        - Call tool.describe with the tool name to get its full schema, guidance, and examples.
+        - Example: tool.describe(name="mcp__feishu__search_doc") reveals its parameters immediately.
         - NEVER guess arguments for unfamiliar tools — always discover first, then call.
-        - You may expand multiple tools at once: '$web_search $schedule_add'.
         </tool_discovery>
         <tool_description>
         IMPORTANT: Every tool call MUST include a non-empty 'description' parameter.

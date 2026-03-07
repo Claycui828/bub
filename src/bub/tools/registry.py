@@ -94,6 +94,29 @@ def _output_preview(result: Any) -> str:
     return _shorten_text(output_str, width=60)
 
 
+def system_reminder(content: str) -> str:
+    """Wrap content in a <system-reminder> block for model guidance.
+
+    Use this to inject structured guidance into tool results or messages
+    that the model should treat as system-level instructions.
+    """
+    return f"\n<system-reminder>\n{content}\n</system-reminder>"
+
+
+def _tool_error_with_schema(tool_name: str, error: Exception, parameters: dict[str, Any]) -> str:
+    """Format a tool error with parameter schema for model self-correction.
+
+    Returns a string containing the error message and a system-reminder
+    with the full parameter schema so the model can retry correctly.
+    """
+    schema_json = json.dumps(parameters, indent=2, ensure_ascii=False)
+    reminder = system_reminder(
+        f"Tool '{tool_name}' call failed. Review the correct parameter schema and retry:\n"
+        f"{schema_json}"
+    )
+    return f"Error: {error}{reminder}"
+
+
 @dataclass(frozen=True)
 class ToolGuidance:
     """Structured usage guidance for a tool."""
@@ -300,6 +323,11 @@ class ToolRegistry:
                         "elapsed_ms": elapsed_ms,
                     },
                 )
+                # Return error with schema instead of raising so the model
+                # can see the correct schema and retry the tool call.
+                descriptor = self.get(tool_name)
+                if descriptor:
+                    return _tool_error_with_schema(tool_name, exc, descriptor.tool.parameters)
                 raise
             else:
                 elapsed_ms = (time.monotonic() - start) * 1000
@@ -396,19 +424,21 @@ class ToolRegistry:
                         "elapsed_ms": elapsed_ms,
                     },
                 )
-                raise
-            else:
-                elapsed_ms = (time.monotonic() - start_time) * 1000
-                span.end(output=str(result)[:4096] if result else None)
+                # Return error with schema instead of raising so the model
+                # can see the correct schema and retry the tool call.
+                return _tool_error_with_schema(name, exc, descriptor.tool.parameters)
 
-                preview = _output_preview(result)
-                self._emit_live(
-                    "tool.end",
-                    {
-                        "name": name,
-                        "status": "ok",
-                        "elapsed_ms": elapsed_ms,
-                        "output_preview": preview,
-                    },
-                )
-                return result
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            span.end(output=str(result)[:4096] if result else None)
+
+            preview = _output_preview(result)
+            self._emit_live(
+                "tool.end",
+                {
+                    "name": name,
+                    "status": "ok",
+                    "elapsed_ms": elapsed_ms,
+                    "output_preview": preview,
+                },
+            )
+            return result
